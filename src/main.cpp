@@ -6,21 +6,40 @@
 #include <RCSwitch.h>
 #include <AceButton.h>
 
+// Includes needed for OTA Updates (Over-The-Air updates)
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncElegantOTA.h>
+
+// LCD Screen Display settings
+// ---------------------------
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 #define OLED_RESET    -1 // Reset pin # (or -1 if sharing Arduino reset pin)
 #define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-// Define lines for the SSD Display
-#define SSD_L1 0
+#define SSD_L1 0    // Define lines SSD_Lx for the SSD Display (which pixel position to address for a given line)
 #define SSD_L2 9
 #define SSD_L3 18
 #define SSD_L4 27
 #define SSD_L5 36
 #define SSD_L6 45
 #define SSD_L7 54
+#define PIXELS_PER_CHAR 7
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// Configure WIFI settings
+#define DEV_WIFI_MODE_AP   // DEV_WIFI_MODE_AP or DEV_WIFI_MODE_STATION
+#ifdef DEV_WIFI_MODE_AP
+  const char* ssid = "BKO-GARDEN-DMZ-DEV1";
+  const char* password = "BKOGARDEN123*";
+#else
+  const char* ssid = "Toumim-1st-Floor";
+  const char* password = "GFUCNEE4";
+#endif
+IPAddress IP;
+
+// Constants for Remotes On/Off commands (RM1: Remote 1, RM2: Remote 2)
 #define RM2_A_ON  4195665
 #define RM2_A_OFF 4195668
 
@@ -40,7 +59,8 @@ String lastCommand = "?";
 bool virtualPlug2A = false;
 int onboardLEDStatus = 0;
 
-// Distance Sensor
+
+// Constants and variables to run the Ultrasonic SR04 Distance Sensor
 const int trigPin = 19;
 const int echoPin = 34;
 #define SOUND_SPEED 0.034
@@ -55,22 +75,63 @@ void IRAM_ATTR myISR();
 
 // Forward Declarations
 void displayStatus(void);
+void displayDeviceStatus(void);
 
 using namespace ace_button;
 
-// One button wired to the pin at BUTTON_PIN. Automatically uses the default
-// ButtonConfig. The alternative is to call the AceButton::init() method in
-// setup() below.
+// Initialize the smart BUTTON object
 AceButton button(BUTTON_PIN);
+
+// Initialize Async Web Server used by OTA (and maybe other stuff)
+AsyncWebServer server(80);
 
 // Forward reference to prevent Arduino compiler becoming confused.
 void handleEvent(AceButton*, uint8_t, uint8_t);
 
+// ***********************
+// *****  S E T U P  *****
+// ***********************
 void setup() {
+
+  // Basic setup stuff for ESP communications
   Serial.begin(115200);
   Serial.println();
   Serial.println("Initialize...");
   
+  #ifdef DEV_WIFI_MODE_STATION
+    // Initialize WIFI as a STATION (Client) and wait for connection
+    Serial.println("WIFI operating as STATION mode.");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.println("");
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println("");
+    Serial.print("Connected to ");
+    Serial.println(ssid);
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  #else
+  // Inisitalize WIFI as an ACCESS POINT (AP)
+    Serial.println("WIFI operating as ACCESS POINT (AP) mode.");
+    WiFi.softAP(ssid, password);
+    IP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(IP);
+  #endif
+
+
+  // Initialize OTA (Over-The-Air ElegantOTA system)
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", "Hi! I am ESP32.");
+  });
+  AsyncElegantOTA.begin(&server);    // Start ElegantOTA
+  server.begin();
+  Serial.println("HTTP server started");
+
+
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
@@ -128,7 +189,7 @@ void sendCode(bool on) {
     digitalWrite(LED_BUILTIN, LOW);
   }    
 
-  displayStatus();
+  displayDeviceStatus();
 }
 
 String getCommandName(int v) {
@@ -153,6 +214,36 @@ String getCommandName(int v) {
   { return "N/A"; }
 }
 
+void displayDeviceStatus(void) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Display Line 1
+  display.setCursor(128 - (5 * PIXELS_PER_CHAR), SSD_L1);
+  display.println(F("v1.00"));
+  display.setCursor(0, SSD_L1);
+  display.println(F("BKO-DMZ-DEV1"));
+
+  // display.setCursor(0, SSD_L2);
+  // display.println(F("SSID:"));
+  display.setCursor(0 * PIXELS_PER_CHAR, SSD_L2);
+  display.println(F("BKO-GARDEN-DMZ-DEV1"));
+
+  // display.setCursor(0, SSD_L3);
+  // display.println(F("IP:"));
+  display.setCursor(0 * PIXELS_PER_CHAR, SSD_L3);
+  display.println(F("xxx.xxx.xx.xx"));
+
+  display.setCursor(0, SSD_L4);
+  display.println(F("IP:"));
+  display.setCursor(0 * PIXELS_PER_CHAR, SSD_L4);
+  display.println(IP.toString());
+
+  // Refresh the display
+  display.display();
+}
+
 void displayStatus(void) {
   // Serial.println("Display Status...");
   display.clearDisplay();
@@ -160,7 +251,7 @@ void displayStatus(void) {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, SSD_L1);
-  display.println(F("433Mhz Tester v2.02"));
+  display.println(F("BKO *OTA* v3.00"));
 
   display.setCursor(128 - 10, SSD_L1);
   if (displayUpdateMark) {
@@ -172,7 +263,7 @@ void displayStatus(void) {
   }
 
   // Display MODE info
-  display.setCursor(0,SSD_L2);
+  display.setCursor(0, SSD_L2);
   display.print(F("Mode: "));
 
   if (mode == 1) {
@@ -330,7 +421,7 @@ void loop() {
 
   if (interuptCounter != previousInteruptCounter) {
     previousInteruptCounter = interuptCounter;
-    displayStatus();
+    displayDeviceStatus();
   }  
 
   if ((millis() - previousMS) > 1000) {
@@ -356,17 +447,17 @@ void loop() {
     Serial.print(distanceInch);
     Serial.println(" inches) ");
     
-    displayStatus();
+    displayDeviceStatus();
 
-    if (distanceCm > 28.0 && distanceCm < 32.00) {
-        Serial.println("Switch Plug ON based on distance");
-        sendCode(LIGHT_ON);
-        virtualPlug2A = LIGHT_ON;
-    } else     if (distanceCm > 38.0 && distanceCm < 45.00) {
-        Serial.println("Switch Plug OFF based on distance");
-        sendCode(LIGHT_OFF);
-        virtualPlug2A = LIGHT_OFF;      
-    }
+    // if (distanceCm > 28.0 && distanceCm < 32.00) {
+    //     Serial.println("Switch Plug ON based on distance");
+    //     sendCode(LIGHT_ON);
+    //     virtualPlug2A = LIGHT_ON;
+    // } else     if (distanceCm > 38.0 && distanceCm < 45.00) {
+    //     Serial.println("Switch Plug OFF based on distance");
+    //     sendCode(LIGHT_OFF);
+    //     virtualPlug2A = LIGHT_OFF;      
+    // }
   }
 }
 
