@@ -160,7 +160,7 @@ void displayStatus(void) {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, SSD_L1);
-  display.println(F("433Mhz Tester v2.01"));
+  display.println(F("433Mhz Tester v2.02"));
 
   display.setCursor(128 - 10, SSD_L1);
   if (displayUpdateMark) {
