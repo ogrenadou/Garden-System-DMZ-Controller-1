@@ -12,6 +12,9 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
+#define VERSION "v1.03"
+#define DEVICE_NAME "BKO-DMZ-DEV1"
+
 // LCD Screen Display settings
 // ---------------------------
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
@@ -33,11 +36,40 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #ifdef DEV_WIFI_MODE_AP
   const char* ssid = "BKO-GARDEN-DMZ-DEV1";
   const char* password = "BKOGARDEN123*";
+  const char* wifimode = "AP";
 #else
   const char* ssid = "Toumim-1st-Floor";
   const char* password = "GFUCNEE4";
+  const char* wifimode = "STATION";
 #endif
 IPAddress IP;
+
+// Variables for water sensors and calculations
+// - "Virtual Zero Height" represents the water level when the klong is at open pipe level (target full capacity)
+// - "Negative Measures" means the water level is below the virtual zero height
+// - "Positive Measures" means the water level is above the virtual zero height
+int   southKlongSensor_VirtualZero = 15;      // Water distance from the sensor to the water when at target full capacity
+float southKlong_SensorWaterDistance = 0;     // In centimeters, the distance between the sensor and the water
+float southKlong_CurrentWaterLevel = 0.0;     // In centimeters, the current relative water level from the virtual zero level. 
+                                              // n > 0 = water is above target, n < 0 = water is below target
+int   publicKlongSensor_VirtualZero = 25;     // Water distance from the sensor to the water when public klong is the same as south klong target full capacity
+float publicKlong_SensorWaterDistance = 0;    // In centimeters, the distance between the sensor and the water
+float publicKlong_CurrentWaterLevel = 0.0;    // In centimeters, the current relative water level from the virtual zero level. 
+                                              // n > 0 = water is above target, n < 0 = water is below target
+int   publicKlong_PumpMinimumWaterLevel = 150;  // Distance from Sensor to water level needed to start the pump safely
+int   pumpDecision = 0;
+String systemAnalysis = "";
+
+// Constants and variables to run the Ultrasonic SR04 Distance Sensor
+#define SOUND_SPEED 0.034
+#define CM_TO_INCH 0.393701
+const int sensorPublicKlong_trigPin = 19;
+const int sensorPublicKlong_echoPin = 34;
+const int sensorSouthKlong_trigPin = 19;    // #TODO Change to new sensor Trig Pin number
+const int sensorSouthKlong_echoPin = 34;    // #TODO Change to new sensor Echo Pin number
+long duration;
+float distanceCm;
+
 
 // Constants for Remotes On/Off commands (RM1: Remote 1, RM2: Remote 2)
 #define RM2_A_ON  4195665
@@ -59,17 +91,6 @@ String lastCommand = "?";
 bool virtualPlug2A = false;
 int onboardLEDStatus = 0;
 
-
-// Constants and variables to run the Ultrasonic SR04 Distance Sensor
-const int trigPin = 19;
-const int echoPin = 34;
-#define SOUND_SPEED 0.034
-#define CM_TO_INCH 0.393701
-long duration;
-float distanceCm;
-float distanceInch;
-
-
 RCSwitch mySwitch = RCSwitch();
 void IRAM_ATTR myISR();
 
@@ -87,6 +108,39 @@ AsyncWebServer server(80);
 
 // Forward reference to prevent Arduino compiler becoming confused.
 void handleEvent(AceButton*, uint8_t, uint8_t);
+
+
+void calculateWaterLevels() {
+  publicKlong_CurrentWaterLevel = publicKlongSensor_VirtualZero - publicKlong_SensorWaterDistance;
+  southKlong_CurrentWaterLevel = southKlongSensor_VirtualZero - southKlong_SensorWaterDistance;
+}
+
+void analyzeWaterLevels() {
+  // Analyze Water Levels to conclude what to do
+  systemAnalysis = "Checking...";
+
+  // Check water levels to make decisions:
+  // - If South Klong is full, no need to pump
+  // - If South Klong needs wather, check if there is enough water in Public Klong to operate the pump
+
+  if (southKlong_CurrentWaterLevel >= 0) {
+    pumpDecision = 0;
+    systemAnalysis = "All set!";
+  } else { 
+    if (publicKlong_SensorWaterDistance < publicKlong_PumpMinimumWaterLevel) {
+      pumpDecision = 1;
+      systemAnalysis = "Pump!";
+    } else {
+      pumpDecision = -1;
+      systemAnalysis = "Cant Pump";
+    }
+  }
+
+float publicKlong_CurrentWaterLevel = 0.0;    // In centimeters, the current relative water level from the virtual zero level. 
+                                              // n > 0 = water is above target, n < 0 = water is below target
+int   publicKlong_PumpMinimumWaterLevel = 150;  // Distance from Sensor to water level needed to start the pump safely
+
+}
 
 // ***********************
 // *****  S E T U P  *****
@@ -156,14 +210,17 @@ void setup() {
     for(;;); // Don't proceed, loop forever
   }
 
-  display.clearDisplay();
-  display.display();
-
   mySwitch.enableReceive(GPIO_RF);  // Receiver input on interrupt 0 (D2) OR D3???
   mySwitch.enableTransmit(25);
 
-  pinMode(trigPin, OUTPUT); // Sets the trigPin as an Output
-  pinMode(echoPin, INPUT); // Sets the echoPin as an Input
+  // Confirgure Ultrasounic Distance/Meter Sensors Pins
+  pinMode(sensorPublicKlong_trigPin, OUTPUT); // Sets the sensorPublicKlong_trigPin as an Output
+  pinMode(sensorPublicKlong_echoPin, INPUT); // Sets the sensorPublicKlong_echoPin as an Input
+  pinMode(sensorSouthKlong_trigPin, OUTPUT); // Sets the sensorPublicKlong_trigPin as an Output
+  pinMode(sensorSouthKlong_echoPin, INPUT); // Sets the sensorPublicKlong_echoPin as an Input
+
+  display.clearDisplay();
+  display.display();
 
   Serial.println("Initialized!");
 }
@@ -219,112 +276,82 @@ void displayDeviceStatus(void) {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // Display Line 1
+  // Display Line 1: Device Identification and firmware version
   display.setCursor(128 - (5 * PIXELS_PER_CHAR), SSD_L1);
-  display.println(F("v1.00"));
+  display.print(VERSION);
   display.setCursor(0, SSD_L1);
-  display.println(F("BKO-DMZ-DEV1"));
+  display.print("#");
+  display.print(DEVICE_NAME);
 
-  // display.setCursor(0, SSD_L2);
-  // display.println(F("SSID:"));
+  // Display Line 2: Wifi SSID name (can be AP or STATION mode)
   display.setCursor(0 * PIXELS_PER_CHAR, SSD_L2);
-  display.println(F("BKO-GARDEN-DMZ-DEV1"));
+  display.print(ssid);
 
-  // display.setCursor(0, SSD_L3);
-  // display.println(F("IP:"));
-  display.setCursor(0 * PIXELS_PER_CHAR, SSD_L3);
-  display.println(F("xxx.xxx.xx.xx"));
-
-  display.setCursor(0, SSD_L4);
-  display.println(F("IP:"));
-  display.setCursor(0 * PIXELS_PER_CHAR, SSD_L4);
-  display.println(IP.toString());
-
-  // Refresh the display
-  display.display();
-}
-
-void displayStatus(void) {
-  // Serial.println("Display Status...");
-  display.clearDisplay();
-
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, SSD_L1);
-  display.println(F("BKO *OTA* v3.00"));
-
-  display.setCursor(128 - 10, SSD_L1);
-  if (displayUpdateMark) {
-    display.print("/");
-    displayUpdateMark = !displayUpdateMark;
-  } else {
-    display.print("\\");
-    displayUpdateMark = !displayUpdateMark;
-  }
-
-  // Display MODE info
-  display.setCursor(0, SSD_L2);
-  display.print(F("Mode: "));
-
-  if (mode == 1) {
-    display.print("LEARN   ");
-    // mode = 2;
-  } else {
-    display.print("LISTEN  ");
-    // mode = 1;
-  }
-
-  // display H/L levels
-  if (digitalRead(GPIO_RF) == HIGH) {
-    display.print("H/");
-  } else {
-    display.print("L/");
-  }
-
-  if (digitalRead(BUTTON_PIN) == HIGH) {
-    display.print("H");
-  } else {
-    display.print("L");
-  }
-
-  // Display Received Data + Data PIN number
+  // Display Line 3: Current device IP Address and WIFI mode
   display.setCursor(0, SSD_L3);
-  display.print(F("Last code: "));
+  display.print(IP.toString());
+  display.print(" (");
+  display.print(wifimode);
+  display.print(")");
+
+  // Display Line 4: Water Levels (Headers)
   display.setCursor(0, SSD_L4);
-  display.print("RF:  ");
-  display.print(lastRFvalue);
-  display.setCursor(128 - 20, SSD_L4);
-  display.print(GPIO_RF);
-  // Display COMMAND name
+  display.print("South Kl.");
+  display.setCursor(64, SSD_L4);
+  display.print("Public Kl.");
+
+  // Display Line 5: Water Levels (Values)
   display.setCursor(0, SSD_L5);
-  display.print(F("CMD: "));
-  display.print(getCommandName(lastRFvalue));
-
-  // Display INTERRUPT Data + Interrupt PIN number
-  display.setCursor(0, SSD_L7);
-  display.print("INT: ");
-  display.print(interuptCounter);
-  display.setCursor(128 - 20, SSD_L7);
-  display.print(BUTTON_PIN);
-
-  // Display LIGHT ON/OFF status
-  display.setCursor(0,SSD_L6);
-  display.print("Plug: ");
-  if (virtualPlug2A) {
-    display.print("ON");
-  } else {
-    display.print("OFF");
-  }
-
-  // Display Distance
-  display.setCursor(50, SSD_L7);
-  display.print(distanceCm);
+//  display.print("-12.72");
+  display.print(southKlong_CurrentWaterLevel);
   display.print("cm");
+  display.setCursor(64, SSD_L5);
+//  display.print("-104.83");
+  display.print(publicKlong_CurrentWaterLevel);
+  display.print("cm");
+  
+  // Display Line 7: Pump Status
+  display.setCursor(0, SSD_L6);
+  display.print("Pump:");
+  display.print("Ready");
+  display.setCursor(64, SSD_L6);
+  display.print("Mode:");
+  display.print("MAN");
+  
+  // Display Line 8: Timers & Operating Mode / Menu
+  display.setCursor(0, SSD_L7);
+  display.print(systemAnalysis);
+  display.setCursor(64, SSD_L7);
+  display.print("254 min");
 
   // Refresh the display
   display.display();
-}
 
+  // Output all this data on serial console
+  Serial.print("#");
+  Serial.print(DEVICE_NAME);
+  Serial.print(" Wifi: ");
+  Serial.print(wifimode);
+  Serial.print(" Ssid: ");
+  Serial.print(ssid);
+  Serial.print(" ");
+  Serial.print(IP.toString());
+  Serial.print(" Sth Kl: ");
+  Serial.print(southKlong_CurrentWaterLevel);
+  Serial.print("cm");
+  Serial.print(" Pub Kl: ");
+  Serial.print(publicKlong_CurrentWaterLevel);
+  Serial.print("cm");
+  Serial.print(" Pump:");
+  Serial.print("Ready");
+  Serial.print(" Mode:");
+  Serial.print("AUTO");
+  Serial.print(" Analysis: ");
+  Serial.print(systemAnalysis);
+  Serial.print(" Timer: ");
+  Serial.print("254min");
+  Serial.println("");
+}
 
 void IRAM_ATTR myISR() {
     interuptCounter += 1;
@@ -401,6 +428,32 @@ static char * dec2binWzerofill(unsigned long Dec, unsigned int bitLength) {
 }
 
 
+void getWaterSensorsData() {
+  // PUBLIC KLONG
+  // ------------
+  // Trigger the sensor
+  digitalWrite(sensorPublicKlong_trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(sensorPublicKlong_trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(sensorPublicKlong_trigPin, LOW);
+  // Reads the echoPin, returns the sound wave travel time in microseconds
+  duration = pulseIn(sensorPublicKlong_echoPin, HIGH);
+  publicKlong_SensorWaterDistance = duration * SOUND_SPEED/2;
+
+  // SOUTH KLONG
+  // ------------
+  // Trigger the sensor
+  digitalWrite(sensorSouthKlong_trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(sensorSouthKlong_trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(sensorSouthKlong_trigPin, LOW);
+  // Reads the echoPin, returns the sound wave travel time in microseconds
+  duration = pulseIn(sensorSouthKlong_echoPin, HIGH);
+  southKlong_SensorWaterDistance = duration * SOUND_SPEED/2;
+}
+
 void loop() {
   button.check();
 
@@ -429,24 +482,10 @@ void loop() {
 
     // Distance Sensor measurement
     // ***************************
-    // Clears the trigPin
-    digitalWrite(trigPin, LOW);
-    delayMicroseconds(2);
-    // Sets the trigPin on HIGH state for 10 micro seconds
-    digitalWrite(trigPin, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(trigPin, LOW);
-    // Reads the echoPin, returns the sound wave travel time in microseconds
-    duration = pulseIn(echoPin, HIGH);
-    distanceCm = duration * SOUND_SPEED/2;
-    distanceInch = distanceCm * CM_TO_INCH;
-
-    Serial.print("Distance: ");
-    Serial.print(distanceCm);
-    Serial.print("cm   (");
-    Serial.print(distanceInch);
-    Serial.println(" inches) ");
-    
+    getWaterSensorsData();
+    calculateWaterLevels();
+    analyzeWaterLevels();
+   
     displayDeviceStatus();
 
     // if (distanceCm > 28.0 && distanceCm < 32.00) {
