@@ -12,7 +12,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-#define VERSION "v1.09"
+#define VERSION "v1.10"
 #define DEVICE_NAME "BKO-DMZ-DEV1"
 
 // LCD Screen Display settings
@@ -64,6 +64,11 @@ float publicKlong_CurrentWaterLevel = 0.0;    // In centimeters, the current rel
 int   publicKlong_PumpMinimumWaterLevel = 30;  // Distance from Sensor to water level needed to start tPUBLIC_KLONG_RELAY_PINhe pump safely
 int   publicKlong_PumpDecision = 0;
 String systemAnalysis = "";
+// Provide options for how often we check water and make decisions
+// This helps for debug (more frequently in matter of seconds) or for production (every N minutes)
+int   waterSensorsReadFrequencyOptions[] = { 1, 5, 10, 15, 30, 60, 2 * 60, 5 * 60, 10 * 60, 15 * 60, 30 * 60, 45 * 60, 60 * 60, 120 * 60 };  // Intervals in seconds
+int   waterSensorsReadFrequencySelected = 0;  // The INDEX of the option selected
+unsigned long waterSensorsLastReadTickerMS = 1;
 
 // MEASURE SENSORS settings (Ultrasonic SR04 Distance Sensor)
 #define SOUND_SPEED 0.034
@@ -99,8 +104,7 @@ int mode = 1;   // (1: Learn,  2: Display)
 int lastRFvalue = 0;
 int previousRFvalue = -1;
 int GPIO_RF = 5;
-int BUTTON_PIN = 18;
-int previousMS = 0;
+unsigned long previousMS = 0;
 bool displayUpdateMark = false;
 String lastCommand = "?";
 bool virtualPlug2A = false;
@@ -116,14 +120,25 @@ void updateDisplay(void);
 
 using namespace ace_button;
 
-// Initialize the smart BUTTON object
-AceButton button(BUTTON_PIN);
+// Initialize all smart buttons
+#define BUTTON_MODE_PIN     18
+#define BUTTON_OPTIONS_PIN   15
+#define BUTTON_CONFIRM_PIN  2
+AceButton btnChangeMode(BUTTON_MODE_PIN);
+AceButton btnOptions(BUTTON_OPTIONS_PIN);
+AceButton btnConfirm(BUTTON_CONFIRM_PIN);
 
 // Initialize Async Web Server used by OTA (and maybe other stuff)
 AsyncWebServer server(80);
 
 // Forward reference to prevent Arduino compiler becoming confused.
-void handleEvent(AceButton*, uint8_t, uint8_t);
+void btnChangeModeHandleEvent(AceButton*, uint8_t, uint8_t);
+void btnOptionsHandleEvent(AceButton*, uint8_t, uint8_t);
+void btnConfirmHandleEvent(AceButton*, uint8_t, uint8_t);
+
+int getPreferredSensorRefreshFrequencyInSeconds() {
+  return waterSensorsReadFrequencyOptions[waterSensorsReadFrequencySelected];
+}
 
 #pragma region Pump Controllers
 
@@ -294,15 +309,19 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  // Configure the ButtonConfig with the event handler, and enable all higher level events.
-  ButtonConfig* buttonConfig = button.getButtonConfig();
-  buttonConfig->setEventHandler(handleEvent);
-  buttonConfig->setFeature(ButtonConfig::kFeatureClick);
-  buttonConfig->setFeature(ButtonConfig::kFeatureDoubleClick);
-  buttonConfig->setFeature(ButtonConfig::kFeatureLongPress);
-  buttonConfig->setFeature(ButtonConfig::kFeatureRepeatPress);
+  // CONFIGURE ALL SMART BUTTONS
+  pinMode(BUTTON_MODE_PIN, INPUT_PULLUP);
+  ButtonConfig* buttonModeConfig = btnChangeMode.getButtonConfig();
+  buttonModeConfig->setEventHandler(btnChangeModeHandleEvent);
+  buttonModeConfig->setFeature(ButtonConfig::kFeatureClick);
+  pinMode(BUTTON_OPTIONS_PIN, INPUT_PULLUP);
+  ButtonConfig* buttonOptionsConfig = btnOptions.getButtonConfig();
+  buttonOptionsConfig->setEventHandler(btnOptionsHandleEvent);
+  buttonOptionsConfig->setFeature(ButtonConfig::kFeatureClick);
+  pinMode(BUTTON_CONFIRM_PIN, INPUT_PULLUP);
+  ButtonConfig* buttonConfirmConfig = btnConfirm.getButtonConfig();
+  buttonConfirmConfig->setEventHandler(btnConfirmHandleEvent);
+  buttonConfirmConfig->setFeature(ButtonConfig::kFeatureClick);
 
   // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -398,6 +417,12 @@ void displayDeviceStatus(void) {
   display.print(publicKlong_PumpMinimumWaterLevel);
   display.print("cm");
   
+  // Display Line 6: Time in seconds until next measure/action
+  display.setCursor(0, SSD_L5);
+  display.print("Next: ");
+  display.print(getPreferredSensorRefreshFrequencyInSeconds() - (millis() - waterSensorsLastReadTickerMS) / 1000);
+  display.print("s");
+
   // Display Line 7: Pump Status
   display.setCursor(0, SSD_L6);
   display.print("Pump:");
@@ -512,35 +537,9 @@ void printAllDeviceDataToSerial() {
   Serial.print(systemAnalysis);
   Serial.print(" Timer: ");
   Serial.print("254min");
+  Serial.print(" Time to update: ");
+  Serial.print(getPreferredSensorRefreshFrequencyInSeconds() - (millis() - waterSensorsLastReadTickerMS) / 1000);
   Serial.println("");
-}
-
-static const char* bin2tristate(const char* bin);
-static char * dec2binWzerofill(unsigned long Dec, unsigned int bitLength);
-
-void output(unsigned long decimal, unsigned int length, unsigned int delay, unsigned int* raw, unsigned int protocol) {
-  const char* b = dec2binWzerofill(decimal, length);
-  Serial.print("Decimal: ");
-  Serial.print(decimal);
-  Serial.print(" (");
-  Serial.print( length );
-  Serial.print("Bit) Binary: ");
-  Serial.print( b );
-  Serial.print(" Tri-State: ");
-  Serial.print( bin2tristate( b) );
-  Serial.print(" PulseLength: ");
-  Serial.print(delay);
-  Serial.print(" microseconds");
-  Serial.print(" Protocol: ");
-  Serial.println(protocol);
-  
-  Serial.print("Raw data: ");
-  for (unsigned int i=0; i<= length*2; i++) {
-    Serial.print(raw[i]);
-    Serial.print(",");
-  }
-  Serial.println();
-  Serial.println();
 }
 
 static const char* bin2tristate(const char* bin) {
@@ -585,6 +584,31 @@ static char * dec2binWzerofill(unsigned long Dec, unsigned int bitLength) {
   return bin;
 }
 
+void output(unsigned long decimal, unsigned int length, unsigned int delay, unsigned int* raw, unsigned int protocol) {
+  const char* b = dec2binWzerofill(decimal, length);
+  Serial.print("Decimal: ");
+  Serial.print(decimal);
+  Serial.print(" (");
+  Serial.print( length );
+  Serial.print("Bit) Binary: ");
+  Serial.print( b );
+  Serial.print(" Tri-State: ");
+  Serial.print( bin2tristate( b) );
+  Serial.print(" PulseLength: ");
+  Serial.print(delay);
+  Serial.print(" microseconds");
+  Serial.print(" Protocol: ");
+  Serial.println(protocol);
+  
+  Serial.print("Raw data: ");
+  for (unsigned int i=0; i<= length*2; i++) {
+    Serial.print(raw[i]);
+    Serial.print(",");
+  }
+  Serial.println();
+  Serial.println();
+}
+
 
 void getWaterSensorsData() {
   // PUBLIC KLONG
@@ -599,22 +623,21 @@ void getWaterSensorsData() {
   duration = pulseIn(sensorPublicKlong_echoPin, HIGH);
   publicKlong_SensorWaterDistance = duration * SOUND_SPEED/2;
 
-  delay(300);
-  // SOUTH KLONG
-  // ------------
-  // Trigger the sensor
-  digitalWrite(sensorSouthKlong_trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(sensorSouthKlong_trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(sensorSouthKlong_trigPin, LOW);
-  // Reads the echoPin, returns the sound wave travel time in microseconds
-  duration = pulseIn(sensorSouthKlong_echoPin, HIGH);
-  southKlong_SensorWaterDistance = duration * SOUND_SPEED/2;
+  // // SOUTH KLONG
+  // // ------------
+  // // Trigger the sensor
+  // digitalWrite(sensorSouthKlong_trigPin, LOW);
+  // delayMicroseconds(2);
+  // digitalWrite(sensorSouthKlong_trigPin, HIGH);
+  // delayMicroseconds(10);
+  // digitalWrite(sensorSouthKlong_trigPin, LOW);
+  // // Reads the echoPin, returns the sound wave travel time in microseconds
+  // duration = pulseIn(sensorSouthKlong_echoPin, HIGH);
+  // southKlong_SensorWaterDistance = duration * SOUND_SPEED/2;
 }
 
 void loop() {
-  button.check();
+  btnChangeMode.check();
 
   // Handle 433Mhz Communication Events
   if (mySwitch.available()) {
@@ -634,41 +657,79 @@ void loop() {
   // ------------------------------
   if ((millis() - previousMS) > 1000) {
     previousMS = millis();
-
-    // Debug all data
     printAllDeviceDataToSerial();
+    // Gather sensors data but do not action pumps, this is a 1 second frequency section only
+    getWaterSensorsData();
+    calculateWaterLevels();
+    updatePumpTimers();
+    updateDisplay();
+  }
+  
+  // Handle the Timer for Water Sensor analysis & Decision
+  // based on preferred frequency settings
+  // -----------------------------------------------------
+  if ((millis() - waterSensorsLastReadTickerMS) > getPreferredSensorRefreshFrequencyInSeconds() * 1000) {
+    waterSensorsLastReadTickerMS = millis();
+    Serial.print("Time for analysis: ");
+    Serial.print("Frequency (sec): ");
+    Serial.print(getPreferredSensorRefreshFrequencyInSeconds());
+    Serial.print("  Elaspe: ");
+    Serial.print((millis() - waterSensorsLastReadTickerMS));
+    Serial.println();
 
     // Distance Sensor measurement
     // ***************************
     getWaterSensorsData();
     calculateWaterLevels();
     analyzeWaterLevels();
-   
     updateDisplay();
   }
-  
+
 }
 
-
-
-// The event handler for the button.
-void handleEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState) {
-
+// CHANGE MODE button event handler
+void btnChangeModeHandleEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState) {
   // Print out a message for all events.
-  Serial.print(F("handleEvent(): eventType: "));
+  Serial.print(F("btnChangeModeHandleEvent(): eventType: "));
   Serial.print(eventType);
   Serial.print(F("; buttonState: "));
   Serial.println(buttonState);
 
   switch (eventType) {
-    case AceButton::kEventPressed:
-      switchToNextDisplayMode();
-      break;
-    case AceButton::kEventReleased:
-      break;
-    case AceButton::kEventLongPressed:
-      break;
     case AceButton::kEventClicked:
+      Serial.println("CHANGE MODE button clicked");
+      switchToNextDisplayMode();
       break;
   }
 }
+
+// CHANGE MODE button event handler
+void btnOptionsHandleEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState) {
+  // Print out a message for all events.
+  Serial.print(F("btnOptionsHandleEvent(): eventType: "));
+  Serial.print(eventType);
+  Serial.print(F("; buttonState: "));
+  Serial.println(buttonState);
+
+  switch (eventType) {
+    case AceButton::kEventClicked:
+      Serial.println("OPTIONS button clicked");
+      break;
+  }
+}
+
+// CHANGE MODE button event handler
+void btnConfirmHandleEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState) {
+  // Print out a message for all events.
+  Serial.print(F("btnConfirmHandleEvent(): eventType: "));
+  Serial.print(eventType);
+  Serial.print(F("; buttonState: "));
+  Serial.println(buttonState);
+
+  switch (eventType) {
+    case AceButton::kEventClicked:
+      Serial.println("CONFIRM button clicked");
+      break;
+  }
+}
+
