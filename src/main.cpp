@@ -12,7 +12,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-#define VERSION "v1.06"
+#define VERSION "v1.09"
 #define DEVICE_NAME "BKO-DMZ-DEV1"
 
 // LCD Screen Display settings
@@ -43,6 +43,11 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
   const char* wifimode = "STATION";
 #endif
 IPAddress IP;
+
+// DISPLAY MODE settings
+#define DISPLAY_MODE_OPERATIONS 0
+#define DISPLAY_MODE_WIFI       1
+int DISPLAY_MODE = 0;
 
 // WATER MEASURES settings
 // - "Virtual Zero Height" represents the water level when the klong is at open pipe level (target full capacity)
@@ -95,8 +100,6 @@ int lastRFvalue = 0;
 int previousRFvalue = -1;
 int GPIO_RF = 5;
 int BUTTON_PIN = 18;
-int interuptCounter = 0;
-int previousInteruptCounter = -1;
 int previousMS = 0;
 bool displayUpdateMark = false;
 String lastCommand = "?";
@@ -104,11 +107,12 @@ bool virtualPlug2A = false;
 int onboardLEDStatus = 0;
 
 RCSwitch mySwitch = RCSwitch();
-void IRAM_ATTR myISR();
 
 // Forward Declarations
 void displayStatus(void);
 void displayDeviceStatus(void);
+void updateWifiStatus(void);
+void updateDisplay(void);
 
 using namespace ace_button;
 
@@ -290,14 +294,9 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
-  // Button uses the built-in pull up register.
-//  pinMode(BUTTON_PIN, INPUT_PULLUP);
-//  attachInterrupt(BUTTON_PIN, myISR, RISING); // FALLING);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  // Configure the ButtonConfig with the event handler, and enable all higher
-  // level events.
-
+  // Configure the ButtonConfig with the event handler, and enable all higher level events.
   ButtonConfig* buttonConfig = button.getButtonConfig();
   buttonConfig->setEventHandler(handleEvent);
   buttonConfig->setFeature(ButtonConfig::kFeatureClick);
@@ -347,7 +346,7 @@ void sendCode(bool on) {
     digitalWrite(LED_BUILTIN, LOW);
   }    
 
-  displayDeviceStatus();
+  updateDisplay();
 }
 
 String getCommandName(int v) {
@@ -384,29 +383,18 @@ void displayDeviceStatus(void) {
   display.print("#");
   display.print(DEVICE_NAME);
 
-  // Display Line 2: Wifi SSID name (can be AP or STATION mode)
-  display.setCursor(0 * PIXELS_PER_CHAR, SSD_L2);
-  display.print(ssid);
-
-  // Display Line 3: Current device IP Address and WIFI mode
-  display.setCursor(0, SSD_L3);
-  display.print(IP.toString());
-  display.print(" (");
-  display.print(wifimode);
-  display.print(")");
-
   // Display Line 4: Water Levels (Headers)
-  display.setCursor(0, SSD_L4);
-  display.print("Water Lvl.");
-  display.setCursor(75, SSD_L4);
+  display.setCursor(0, SSD_L3);
+  display.print("Sensor");
+  display.setCursor(75, SSD_L3);
   display.print("Required");
 
   // Display Line 5: Water Levels (Values)
-  display.setCursor(0, SSD_L5);
+  display.setCursor(0, SSD_L4);
   // display.print(southKlong_CurrentWaterLevel);
   display.print(publicKlong_SensorWaterDistance);
   display.print("cm");
-  display.setCursor(75, SSD_L5);
+  display.setCursor(75, SSD_L4);
   display.print(publicKlong_PumpMinimumWaterLevel);
   display.print("cm");
   
@@ -435,7 +423,64 @@ void displayDeviceStatus(void) {
   // Refresh the display
   display.display();
 
-  // Output all this data on serial console
+}
+
+void displayWifiStatus(void) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(128 - (5 * PIXELS_PER_CHAR), SSD_L1);
+  display.print(VERSION);
+  display.setCursor(0, SSD_L1);
+  display.print("#");
+  display.print(DEVICE_NAME);
+
+  display.setCursor(0, SSD_L2);
+  display.print("WIFI Mode: ");
+  display.println(wifimode);
+  display.println("Name:");
+  display.println(ssid);
+  #ifdef DEV_WIFI_MODE_AP
+    display.println("Pwd:");
+    display.println(password);
+  #endif
+  display.print("IP:");
+  display.println(IP.toString());
+
+  display.display();
+}
+
+void displayInvalidDisplayMode(void) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, SSD_L1);
+  display.println("INVALID");
+  display.println("DISPLAY");
+  display.println("MODE!");
+  display.println(" ");
+  display.println("Press button again!");
+
+  display.display();
+}
+
+void updateDisplay(void) {
+  if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) displayDeviceStatus();
+  else if (DISPLAY_MODE == DISPLAY_MODE_WIFI) displayWifiStatus();
+  else displayInvalidDisplayMode();
+}
+
+void switchToNextDisplayMode(void) {
+  if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) DISPLAY_MODE = DISPLAY_MODE_WIFI;
+  else if (DISPLAY_MODE == DISPLAY_MODE_WIFI) DISPLAY_MODE = -1;
+  else if (DISPLAY_MODE == -1) DISPLAY_MODE = DISPLAY_MODE_OPERATIONS;
+  updateDisplay();
+}
+
+// Output all information to serial console (RX/TX)
+void printAllDeviceDataToSerial() {
   Serial.print("#");
   Serial.print(DEVICE_NAME);
   Serial.print(" Wifi: ");
@@ -447,9 +492,12 @@ void displayDeviceStatus(void) {
   Serial.print(" Sth Kl: ");
   Serial.print(southKlong_CurrentWaterLevel);
   Serial.print("cm");
-  Serial.print(" Pub Kl: ");
+  Serial.print(" Public Klong: ");
+  Serial.print(" Sensor: ");
+  Serial.print(publicKlong_SensorWaterDistance);
+  Serial.print(" Level: ");
   Serial.print(publicKlong_CurrentWaterLevel);
-  Serial.print("Pump:");
+  Serial.print(" Pump: ");
   if (publicKlong_PumpDecision == 1) {
     Serial.print("ON");
     Serial.print(" ");
@@ -465,10 +513,6 @@ void displayDeviceStatus(void) {
   Serial.print(" Timer: ");
   Serial.print("254min");
   Serial.println("");
-}
-
-void IRAM_ATTR myISR() {
-    interuptCounter += 1;
 }
 
 static const char* bin2tristate(const char* bin);
@@ -572,13 +616,12 @@ void getWaterSensorsData() {
 void loop() {
   button.check();
 
+  // Handle 433Mhz Communication Events
   if (mySwitch.available()) {
     lastRFvalue = mySwitch.getReceivedValue();
     output(mySwitch.getReceivedValue(), mySwitch.getReceivedBitlength(), mySwitch.getReceivedDelay(), mySwitch.getReceivedRawdata(), mySwitch.getReceivedProtocol());
-
     // if (lastRFvalue == RM2_A_ON)  { delay(800); digitalWrite(LED_BUILTIN, HIGH); sendCode(true); }
     // if (lastRFvalue == RM2_A_OFF) { delay(800); digitalWrite(LED_BUILTIN, LOW);  sendCode(false); }
-
     delay(1);
     mySwitch.resetAvailable();
   }
@@ -587,13 +630,13 @@ void loop() {
     previousRFvalue = lastRFvalue;
   }
 
-  if (interuptCounter != previousInteruptCounter) {
-    previousInteruptCounter = interuptCounter;
-    displayDeviceStatus();
-  }  
-
+  // Do watever needed every second
+  // ------------------------------
   if ((millis() - previousMS) > 1000) {
     previousMS = millis();
+
+    // Debug all data
+    printAllDeviceDataToSerial();
 
     // Distance Sensor measurement
     // ***************************
@@ -601,18 +644,9 @@ void loop() {
     calculateWaterLevels();
     analyzeWaterLevels();
    
-    displayDeviceStatus();
-
-    // if (distanceCm > 28.0 && distanceCm < 32.00) {
-    //     Serial.println("Switch Plug ON based on distance");
-    //     sendCode(LIGHT_ON);
-    //     virtualPlug2A = LIGHT_ON;
-    // } else     if (distanceCm > 38.0 && distanceCm < 45.00) {
-    //     Serial.println("Switch Plug OFF based on distance");
-    //     sendCode(LIGHT_OFF);
-    //     virtualPlug2A = LIGHT_OFF;      
-    // }
+    updateDisplay();
   }
+  
 }
 
 
@@ -627,20 +661,14 @@ void handleEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState
   Serial.println(buttonState);
 
   switch (eventType) {
-    // case AceButton::kEventPressed:
-    //   digitalWrite(LED_PIN, LED_ON);
-    //   break;
+    case AceButton::kEventPressed:
+      switchToNextDisplayMode();
+      break;
     case AceButton::kEventReleased:
-      Serial.println("Button Event: kEventReleased");
-      if (virtualPlug2A) {
-        Serial.println("Switch Plug OFF");
-        sendCode(LIGHT_OFF);
-        virtualPlug2A = LIGHT_OFF;
-      } else {
-        Serial.println("Switch Plug ON");
-        sendCode(LIGHT_ON);
-        virtualPlug2A = LIGHT_ON;
-      }
+      break;
+    case AceButton::kEventLongPressed:
+      break;
+    case AceButton::kEventClicked:
       break;
   }
 }
