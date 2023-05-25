@@ -12,7 +12,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-#define VERSION "v1.03"
+#define VERSION "v1.06"
 #define DEVICE_NAME "BKO-DMZ-DEV1"
 
 // LCD Screen Display settings
@@ -31,7 +31,7 @@
 #define PIXELS_PER_CHAR 7
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// Configure WIFI settings
+// WIFI settings
 #define DEV_WIFI_MODE_AP   // DEV_WIFI_MODE_AP or DEV_WIFI_MODE_STATION
 #ifdef DEV_WIFI_MODE_AP
   const char* ssid = "BKO-GARDEN-DMZ-DEV1";
@@ -44,7 +44,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #endif
 IPAddress IP;
 
-// Variables for water sensors and calculations
+// WATER MEASURES settings
 // - "Virtual Zero Height" represents the water level when the klong is at open pipe level (target full capacity)
 // - "Negative Measures" means the water level is below the virtual zero height
 // - "Positive Measures" means the water level is above the virtual zero height
@@ -56,11 +56,11 @@ int   publicKlongSensor_VirtualZero = 25;     // Water distance from the sensor 
 float publicKlong_SensorWaterDistance = 0;    // In centimeters, the distance between the sensor and the water
 float publicKlong_CurrentWaterLevel = 0.0;    // In centimeters, the current relative water level from the virtual zero level. 
                                               // n > 0 = water is above target, n < 0 = water is below target
-int   publicKlong_PumpMinimumWaterLevel = 150;  // Distance from Sensor to water level needed to start the pump safely
-int   pumpDecision = 0;
+int   publicKlong_PumpMinimumWaterLevel = 30;  // Distance from Sensor to water level needed to start tPUBLIC_KLONG_RELAY_PINhe pump safely
+int   publicKlong_PumpDecision = 0;
 String systemAnalysis = "";
 
-// Constants and variables to run the Ultrasonic SR04 Distance Sensor
+// MEASURE SENSORS settings (Ultrasonic SR04 Distance Sensor)
 #define SOUND_SPEED 0.034
 #define CM_TO_INCH 0.393701
 const int sensorPublicKlong_trigPin = 19;
@@ -70,6 +70,18 @@ const int sensorSouthKlong_echoPin = 34;    // #TODO Change to new sensor Echo P
 long duration;
 float distanceCm;
 
+// RELAY / PUMP Control settings
+#define PUBLIC_KLONG_RELAY_PIN  14
+bool  publicKlong_powered = 0;
+float publicKlong_operating_time_min = 0.0; // Total minutes since the pump started
+unsigned long publicKlong_operating_time_sec = 0; // Total Seconds since the pump started
+unsigned long publicKlong_operating_start = 0;    // Current milliseconds when the pump started
+
+#define SOUTH_KLONG_RELAY_PIN  27
+bool  southKlong_powered = 0;
+float southKlong_operating_time_min = 0.0;  // Total minutes since the pump started
+unsigned long southKlong_operating_time_sec = 0;  // Total Seconds since the pump started
+unsigned long southKlong_operating_start = 0;     // Current milliseconds when the pump started
 
 // Constants for Remotes On/Off commands (RM1: Remote 1, RM2: Remote 2)
 #define RM2_A_ON  4195665
@@ -109,37 +121,121 @@ AsyncWebServer server(80);
 // Forward reference to prevent Arduino compiler becoming confused.
 void handleEvent(AceButton*, uint8_t, uint8_t);
 
+#pragma region Pump Controllers
+
+void startPump1() {
+  if (publicKlong_powered) return;  // Do nothing if already required state
+  publicKlong_powered = 1;
+  publicKlong_operating_start = millis();
+  publicKlong_operating_time_sec = 0;
+  digitalWrite(PUBLIC_KLONG_RELAY_PIN, publicKlong_powered);
+}
+
+void stopPump1() {
+  if (!publicKlong_powered) return;  // Do nothing if already required state
+  publicKlong_powered = 0;
+  publicKlong_operating_start = 0;
+  publicKlong_operating_time_sec = 0;
+  digitalWrite(PUBLIC_KLONG_RELAY_PIN, publicKlong_powered);
+}
+
+void startPump2() {
+  if (southKlong_powered) return;  // Do nothing if already required state
+  southKlong_powered = 1;
+  southKlong_operating_start = millis();
+  southKlong_operating_time_sec = 0;
+  digitalWrite(SOUTH_KLONG_RELAY_PIN, southKlong_powered);
+}
+
+void stopPump2() {
+  if (!southKlong_powered) return;  // Do nothing if already required state
+  southKlong_powered = 0;
+  southKlong_operating_start = 0;
+  southKlong_operating_time_sec = 0;
+  digitalWrite(SOUTH_KLONG_RELAY_PIN, southKlong_powered);
+}
+
+#pragma endregion
 
 void calculateWaterLevels() {
   publicKlong_CurrentWaterLevel = publicKlongSensor_VirtualZero - publicKlong_SensorWaterDistance;
   southKlong_CurrentWaterLevel = southKlongSensor_VirtualZero - southKlong_SensorWaterDistance;
 }
 
+void updatePumpTimers() {
+  // If either timers data show a CPU roll-over, reset timers
+  if (millis() < publicKlong_operating_start || millis() < southKlong_operating_start) {
+    publicKlong_operating_start = 0;
+    publicKlong_operating_time_sec = 0;
+    publicKlong_operating_time_min = 0.0;
+    return;
+  } 
+
+  // Public Klong
+  unsigned long publicKlong_ElapseMS = millis() - publicKlong_operating_start;
+  publicKlong_operating_time_sec = publicKlong_ElapseMS / 1000;
+  publicKlong_operating_time_min = (publicKlong_operating_time_sec / 60) + ((publicKlong_operating_time_sec % 60) / 100.0);
+  
+  // South Klong
+  unsigned long southKlong_ElapseMS = millis() - southKlong_operating_start;
+  southKlong_operating_time_sec = southKlong_ElapseMS / 1000;
+  southKlong_operating_time_min = (southKlong_operating_time_sec / 60) + ((southKlong_operating_time_sec % 60) / 100.0);
+}
+
 void analyzeWaterLevels() {
   // Analyze Water Levels to conclude what to do
   systemAnalysis = "Checking...";
+
+  updatePumpTimers();
+
+  // Cannot make decisions if the sensors returns unrealistic numbers
+  // If so, turn off the pump for safety
+  if ( publicKlong_SensorWaterDistance > 300 || publicKlong_SensorWaterDistance < 5) {
+    // stopPump1();
+    // stopPump2();
+    systemAnalysis = "Invalid measure!";
+    // Keep the pump as it was
+    return;
+  }
 
   // Check water levels to make decisions:
   // - If South Klong is full, no need to pump
   // - If South Klong needs wather, check if there is enough water in Public Klong to operate the pump
 
-  if (southKlong_CurrentWaterLevel >= 0) {
-    pumpDecision = 0;
-    systemAnalysis = "All set!";
-  } else { 
-    if (publicKlong_SensorWaterDistance < publicKlong_PumpMinimumWaterLevel) {
-      pumpDecision = 1;
-      systemAnalysis = "Pump!";
-    } else {
-      pumpDecision = -1;
-      systemAnalysis = "Cant Pump";
-    }
+  if (publicKlong_PumpMinimumWaterLevel > publicKlong_SensorWaterDistance) {
+    publicKlong_PumpDecision = 1;
+    systemAnalysis = "OK to pump!";
+    startPump1();
+    return;
+  } else {
+    publicKlong_PumpDecision = 0;
+    systemAnalysis = "Water TOO LOW to pump";
+    stopPump1();
+    return;
   }
+  
+  // Fancy version when I can measure South Klong to avoid overflow
+  // if (southKlong_CurrentWaterLevel >= 0) {
+  //   publicKlong_PumpDecision = 0;
+  //   systemAnalysis = "All set!";
+  //   stopPump1();
+  // } else { 
+  //   if (publicKlong_SensorWaterDistance < publicKlong_PumpMinimumWaterLevel) {
+  //     publicKlong_PumpDecision = 1;
+  //     systemAnalysis = "Pump!";
+  //     startPump1();
+  //   } else {
+  //     publicKlong_PumpDecision = -1;
+  //     systemAnalysis = "Cant Pump";
+  //     stopPump1();
+  //   }
+  // }
 
-float publicKlong_CurrentWaterLevel = 0.0;    // In centimeters, the current relative water level from the virtual zero level. 
-                                              // n > 0 = water is above target, n < 0 = water is below target
-int   publicKlong_PumpMinimumWaterLevel = 150;  // Distance from Sensor to water level needed to start the pump safely
-
+  // Nothing has been decided at this point (BUG!!!)
+  // Let's turn the pump OFF to be safe
+  publicKlong_PumpDecision = 0;
+  systemAnalysis = "!!! Cannot decide !!!";
+  stopPump1();
 }
 
 // ***********************
@@ -185,6 +281,11 @@ void setup() {
   server.begin();
   Serial.println("HTTP server started");
 
+  // Configure Pump Relay PINs
+  pinMode(PUBLIC_KLONG_RELAY_PIN, OUTPUT);
+  pinMode(SOUTH_KLONG_RELAY_PIN, OUTPUT);
+  digitalWrite(PUBLIC_KLONG_RELAY_PIN, LOW);
+  digitalWrite(SOUTH_KLONG_RELAY_PIN, LOW);
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
@@ -296,33 +397,40 @@ void displayDeviceStatus(void) {
 
   // Display Line 4: Water Levels (Headers)
   display.setCursor(0, SSD_L4);
-  display.print("South Kl.");
-  display.setCursor(64, SSD_L4);
-  display.print("Public Kl.");
+  display.print("Water Lvl.");
+  display.setCursor(75, SSD_L4);
+  display.print("Required");
 
   // Display Line 5: Water Levels (Values)
   display.setCursor(0, SSD_L5);
-//  display.print("-12.72");
-  display.print(southKlong_CurrentWaterLevel);
+  // display.print(southKlong_CurrentWaterLevel);
+  display.print(publicKlong_SensorWaterDistance);
   display.print("cm");
-  display.setCursor(64, SSD_L5);
-//  display.print("-104.83");
-  display.print(publicKlong_CurrentWaterLevel);
+  display.setCursor(75, SSD_L5);
+  display.print(publicKlong_PumpMinimumWaterLevel);
   display.print("cm");
   
   // Display Line 7: Pump Status
   display.setCursor(0, SSD_L6);
   display.print("Pump:");
-  display.print("Ready");
-  display.setCursor(64, SSD_L6);
-  display.print("Mode:");
-  display.print("MAN");
+  if (publicKlong_PumpDecision == 1) {
+    display.print("ON");
+    display.setCursor(64, SSD_L6);
+    display.print(" ");
+    display.print(publicKlong_operating_time_min);
+    display.print(" min");
+  } else {
+    display.print("OFF");
+  }
+
+  // display.print("Mode:");
+  // display.print("AUTO");
   
   // Display Line 8: Timers & Operating Mode / Menu
   display.setCursor(0, SSD_L7);
   display.print(systemAnalysis);
   display.setCursor(64, SSD_L7);
-  display.print("254 min");
+  // display.print("254 min");
 
   // Refresh the display
   display.display();
@@ -341,9 +449,15 @@ void displayDeviceStatus(void) {
   Serial.print("cm");
   Serial.print(" Pub Kl: ");
   Serial.print(publicKlong_CurrentWaterLevel);
-  Serial.print("cm");
-  Serial.print(" Pump:");
-  Serial.print("Ready");
+  Serial.print("Pump:");
+  if (publicKlong_PumpDecision == 1) {
+    Serial.print("ON");
+    Serial.print(" ");
+    Serial.print(publicKlong_operating_time_min);
+    Serial.print(" min");
+  } else {
+    Serial.print("OFF");
+  }
   Serial.print(" Mode:");
   Serial.print("AUTO");
   Serial.print(" Analysis: ");
@@ -441,6 +555,7 @@ void getWaterSensorsData() {
   duration = pulseIn(sensorPublicKlong_echoPin, HIGH);
   publicKlong_SensorWaterDistance = duration * SOUND_SPEED/2;
 
+  delay(300);
   // SOUTH KLONG
   // ------------
   // Trigger the sensor
@@ -461,8 +576,8 @@ void loop() {
     lastRFvalue = mySwitch.getReceivedValue();
     output(mySwitch.getReceivedValue(), mySwitch.getReceivedBitlength(), mySwitch.getReceivedDelay(), mySwitch.getReceivedRawdata(), mySwitch.getReceivedProtocol());
 
-    if (lastRFvalue == RM2_A_ON)  { delay(800); digitalWrite(LED_BUILTIN, HIGH); sendCode(true); }
-    if (lastRFvalue == RM2_A_OFF) { delay(800); digitalWrite(LED_BUILTIN, LOW);  sendCode(false); }
+    // if (lastRFvalue == RM2_A_ON)  { delay(800); digitalWrite(LED_BUILTIN, HIGH); sendCode(true); }
+    // if (lastRFvalue == RM2_A_OFF) { delay(800); digitalWrite(LED_BUILTIN, LOW);  sendCode(false); }
 
     delay(1);
     mySwitch.resetAvailable();
