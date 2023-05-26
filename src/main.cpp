@@ -12,8 +12,32 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-#define VERSION "v1.10"
+#define VERSION "v2.08"
 #define DEVICE_NAME "BKO-DMZ-DEV1"
+
+/// PIN Usage for this project
+//
+//  +----+------------+------------------------------------------------+
+//  |  2 | OUTPUT     | ESP32 Built-in LED                             |
+//  |  4 | INPUT      | Button: Menu                                   |
+//  |  5 | INPUT      | 433Mhz device (Receiver)                       |
+//  | 14 | OUTPUT     | Relay (Pump Public Klong)                      |
+//  | 15 | INPUT      | Button: Dec/Options                            |
+//  | 18 | INPUT      | Button: Inc/Options                            |
+//  | 19 | OUTPUT     | Meter Sensor Trigger pin (Public Klong)        |
+//  | 21 | <-->       | I2C Clock  (Used for LCD display)              |
+//  | 22 | <-->       | I2C Data   (Used for LCD display)              |
+//  | 25 | OUTPUT     | 433Mhz device (Transmitter)                    |
+//  | 26 | INPUT      | Button: Confirm/Cancel                         |
+//  | 27 | OUTPUT     | Relay (Pump South Klong)  NOT IMPLEMENTED      |
+//  | 34 | INPUT      | Meter Sensor Echo pin (Public Klong)           |
+//  | -- |            | RTC Real-time Clock - Clock Pin                |
+//  | -- |            | RTC Real-time Clock - Data Pin                 |
+//  | -- |            | RTC Real-time Clock - Reset Pin                |
+//  | -- | OUTPUT     | Needed for South Clong Meter Sensor (Trig)     |
+//  | -- | IMPUT      | Needed for South Clong Meter Sensor (Echo)     |
+//  |    |            |                                                |
+//  +----+------------+------------------------------------------------+
 
 // LCD Screen Display settings
 // ---------------------------
@@ -47,6 +71,7 @@ IPAddress IP;
 // DISPLAY MODE settings
 #define DISPLAY_MODE_OPERATIONS 0
 #define DISPLAY_MODE_WIFI       1
+#define DISPLAY_MODE_FREQUENCY_SETUP 2
 int DISPLAY_MODE = 0;
 
 // WATER MEASURES settings
@@ -67,8 +92,9 @@ String systemAnalysis = "";
 // Provide options for how often we check water and make decisions
 // This helps for debug (more frequently in matter of seconds) or for production (every N minutes)
 int   waterSensorsReadFrequencyOptions[] = { 1, 5, 10, 15, 30, 60, 2 * 60, 5 * 60, 10 * 60, 15 * 60, 30 * 60, 45 * 60, 60 * 60, 120 * 60 };  // Intervals in seconds
-int   waterSensorsReadFrequencySelected = 0;  // The INDEX of the option selected
-unsigned long waterSensorsLastReadTickerMS = 1;
+int   waterSensorsReadFrequencySelected = 5;  // The INDEX of the option selected (default index 5: 1 minute)
+int   waterSensorsReadFrequencySelection = waterSensorsReadFrequencySelected;  // The INDEX of the option selected
+unsigned long waterSensorsLastReadTickerMS = 0;
 
 // MEASURE SENSORS settings (Ultrasonic SR04 Distance Sensor)
 #define SOUND_SPEED 0.034
@@ -100,17 +126,18 @@ unsigned long southKlong_operating_start = 0;     // Current milliseconds when t
 #define LIGHT_ON true
 #define LIGHT_OFF false
 
+int GPIO_RF_PIN = 5;
+int GPIO_TRANSMIT_PIN = 25;
 int mode = 1;   // (1: Learn,  2: Display)
 int lastRFvalue = 0;
 int previousRFvalue = -1;
-int GPIO_RF = 5;
 unsigned long previousMS = 0;
 bool displayUpdateMark = false;
 String lastCommand = "?";
 bool virtualPlug2A = false;
 int onboardLEDStatus = 0;
 
-RCSwitch mySwitch = RCSwitch();
+RCSwitch myRadioSignalSwitch = RCSwitch();
 
 // Forward Declarations
 void displayStatus(void);
@@ -119,26 +146,50 @@ void updateWifiStatus(void);
 void updateDisplay(void);
 
 using namespace ace_button;
-
 // Initialize all smart buttons
-#define BUTTON_MODE_PIN     18
-#define BUTTON_OPTIONS_PIN   15
-#define BUTTON_CONFIRM_PIN  2
-AceButton btnChangeMode(BUTTON_MODE_PIN);
-AceButton btnOptions(BUTTON_OPTIONS_PIN);
+#define BUTTON_MENU_PIN         26
+#define BUTTON_DEC_OPTIONS_PIN  15
+#define BUTTON_INC_OPTIONS_PIN   4
+#define BUTTON_CONFIRM_PIN      18
+AceButton btnMenu(BUTTON_MENU_PIN);
+AceButton btnDecOptions(BUTTON_DEC_OPTIONS_PIN);
+AceButton btnIncOptions(BUTTON_INC_OPTIONS_PIN);
 AceButton btnConfirm(BUTTON_CONFIRM_PIN);
+void btnHandleEvent(AceButton*, uint8_t, uint8_t);
 
 // Initialize Async Web Server used by OTA (and maybe other stuff)
 AsyncWebServer server(80);
 
-// Forward reference to prevent Arduino compiler becoming confused.
-void btnChangeModeHandleEvent(AceButton*, uint8_t, uint8_t);
-void btnOptionsHandleEvent(AceButton*, uint8_t, uint8_t);
-void btnConfirmHandleEvent(AceButton*, uint8_t, uint8_t);
 
 int getPreferredSensorRefreshFrequencyInSeconds() {
   return waterSensorsReadFrequencyOptions[waterSensorsReadFrequencySelected];
 }
+
+int getPreferredSensorRefreshFrequencyInSeconds(int selectedIndex) {
+  return waterSensorsReadFrequencyOptions[selectedIndex];
+}
+
+char strBuff[20];
+char * getPreferredSensorRefreshFrequencyAsString() {
+  int freq = getPreferredSensorRefreshFrequencyInSeconds();
+  if (freq < 60) {
+    snprintf(strBuff, sizeof(strBuff), "%i sec", freq);
+  } else {
+    snprintf(strBuff, sizeof(strBuff), "%i min", freq / 60);
+  }
+  return strBuff;
+}
+
+char * getPreferredSensorRefreshFrequencyAsString(int selectedIndex) {
+  int freq = getPreferredSensorRefreshFrequencyInSeconds(selectedIndex);
+  if (freq < 60) {
+    snprintf(strBuff, sizeof(strBuff), "%i sec", freq);
+  } else {
+    snprintf(strBuff, sizeof(strBuff), "%i min", freq / 60);
+  }
+  return strBuff;
+}
+
 
 #pragma region Pump Controllers
 
@@ -296,6 +347,7 @@ void setup() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/plain", "Hi! I am ESP32.");
   });
+
   AsyncElegantOTA.begin(&server);    // Start ElegantOTA
   server.begin();
   Serial.println("HTTP server started");
@@ -310,18 +362,15 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
 
   // CONFIGURE ALL SMART BUTTONS
-  pinMode(BUTTON_MODE_PIN, INPUT_PULLUP);
-  ButtonConfig* buttonModeConfig = btnChangeMode.getButtonConfig();
-  buttonModeConfig->setEventHandler(btnChangeModeHandleEvent);
-  buttonModeConfig->setFeature(ButtonConfig::kFeatureClick);
-  pinMode(BUTTON_OPTIONS_PIN, INPUT_PULLUP);
-  ButtonConfig* buttonOptionsConfig = btnOptions.getButtonConfig();
-  buttonOptionsConfig->setEventHandler(btnOptionsHandleEvent);
-  buttonOptionsConfig->setFeature(ButtonConfig::kFeatureClick);
+  pinMode(BUTTON_MENU_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_DEC_OPTIONS_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_INC_OPTIONS_PIN, INPUT_PULLUP);
   pinMode(BUTTON_CONFIRM_PIN, INPUT_PULLUP);
-  ButtonConfig* buttonConfirmConfig = btnConfirm.getButtonConfig();
-  buttonConfirmConfig->setEventHandler(btnConfirmHandleEvent);
-  buttonConfirmConfig->setFeature(ButtonConfig::kFeatureClick);
+  ButtonConfig* buttonConfig = ButtonConfig::getSystemButtonConfig();
+  buttonConfig->setEventHandler(btnHandleEvent);
+  buttonConfig->setFeature(ButtonConfig::kFeatureClick);
+  buttonConfig->setFeature(ButtonConfig::kFeatureDoubleClick);
+  buttonConfig->setFeature(ButtonConfig::kFeatureLongPress);
 
   // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -329,8 +378,8 @@ void setup() {
     for(;;); // Don't proceed, loop forever
   }
 
-  mySwitch.enableReceive(GPIO_RF);  // Receiver input on interrupt 0 (D2) OR D3???
-  mySwitch.enableTransmit(25);
+  myRadioSignalSwitch.enableReceive(GPIO_RF_PIN);  // Receiver input on interrupt 0 (D2) OR D3???
+  myRadioSignalSwitch.enableTransmit(GPIO_TRANSMIT_PIN);  
 
   // Confirgure Ultrasounic Distance/Meter Sensors Pins
   pinMode(sensorPublicKlong_trigPin, OUTPUT); // Sets the sensorPublicKlong_trigPin as an Output
@@ -345,22 +394,22 @@ void setup() {
 }
 
 void sendCode(bool on) {
-  mySwitch.setPulseLength(325);
-  mySwitch.setProtocol(1);
-  mySwitch.setRepeatTransmit(5);
+  myRadioSignalSwitch.setPulseLength(325);
+  myRadioSignalSwitch.setProtocol(1);
+  myRadioSignalSwitch.setRepeatTransmit(5);
 
   Serial.print("Sending Code ");
   Serial.println(on);
   
   if (on) 
   { // RM2-B-ON
-    mySwitch.send("010000000001000101010001"); 
+    myRadioSignalSwitch.send("010000000001000101010001"); 
     virtualPlug2A = true;
     digitalWrite(LED_BUILTIN, HIGH);
   }     
   else 
   { // RM2-B-OFF
-    mySwitch.send("010000000001000101010100"); 
+    myRadioSignalSwitch.send("010000000001000101010100"); 
     virtualPlug2A = false;
     digitalWrite(LED_BUILTIN, LOW);
   }    
@@ -405,7 +454,7 @@ void displayDeviceStatus(void) {
   // Display Line 4: Water Levels (Headers)
   display.setCursor(0, SSD_L3);
   display.print("Sensor");
-  display.setCursor(75, SSD_L3);
+  display.setCursor(67, SSD_L3);
   display.print("Required");
 
   // Display Line 5: Water Levels (Values)
@@ -413,12 +462,15 @@ void displayDeviceStatus(void) {
   // display.print(southKlong_CurrentWaterLevel);
   display.print(publicKlong_SensorWaterDistance);
   display.print("cm");
-  display.setCursor(75, SSD_L4);
+  display.setCursor(67, SSD_L4);
   display.print(publicKlong_PumpMinimumWaterLevel);
   display.print("cm");
   
   // Display Line 6: Time in seconds until next measure/action
   display.setCursor(0, SSD_L5);
+  display.print("Fq: ");
+  display.print(getPreferredSensorRefreshFrequencyAsString());
+  display.setCursor(67, SSD_L5);
   display.print("Next: ");
   display.print(getPreferredSensorRefreshFrequencyInSeconds() - (millis() - waterSensorsLastReadTickerMS) / 1000);
   display.print("s");
@@ -476,6 +528,25 @@ void displayWifiStatus(void) {
   display.display();
 }
 
+void displayFrequencySetup(void) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, SSD_L1);
+  display.println("Frequency Setup:");
+  display.println("");
+  display.print("Current: ");
+  display.println(getPreferredSensorRefreshFrequencyAsString());
+  display.print("New:     ");
+  display.println(getPreferredSensorRefreshFrequencyAsString(waterSensorsReadFrequencySelection));
+  display.println("");
+  display.println("Change: -/+ buttons");
+  display.println("Save: CONFIRM button");
+
+  display.display();
+}
+
 void displayInvalidDisplayMode(void) {
   display.clearDisplay();
   display.setTextSize(1);
@@ -494,18 +565,25 @@ void displayInvalidDisplayMode(void) {
 void updateDisplay(void) {
   if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) displayDeviceStatus();
   else if (DISPLAY_MODE == DISPLAY_MODE_WIFI) displayWifiStatus();
+  else if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) displayFrequencySetup();
   else displayInvalidDisplayMode();
 }
 
 void switchToNextDisplayMode(void) {
   if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) DISPLAY_MODE = DISPLAY_MODE_WIFI;
-  else if (DISPLAY_MODE == DISPLAY_MODE_WIFI) DISPLAY_MODE = -1;
+  else if (DISPLAY_MODE == DISPLAY_MODE_WIFI) DISPLAY_MODE = DISPLAY_MODE_FREQUENCY_SETUP;
+  else if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) DISPLAY_MODE = -1;
   else if (DISPLAY_MODE == -1) DISPLAY_MODE = DISPLAY_MODE_OPERATIONS;
+  // Special actions when switching display mode
+  if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) {
+    waterSensorsReadFrequencySelection = waterSensorsReadFrequencySelected;
+  }
   updateDisplay();
 }
 
 // Output all information to serial console (RX/TX)
 void printAllDeviceDataToSerial() {
+  if (DISPLAY_MODE != DISPLAY_MODE_OPERATIONS) return;
   Serial.print("#");
   Serial.print(DEVICE_NAME);
   Serial.print(" Wifi: ");
@@ -637,16 +715,19 @@ void getWaterSensorsData() {
 }
 
 void loop() {
-  btnChangeMode.check();
+  btnMenu.check();
+  btnDecOptions.check();
+  btnIncOptions.check();
+  btnConfirm.check();
 
   // Handle 433Mhz Communication Events
-  if (mySwitch.available()) {
-    lastRFvalue = mySwitch.getReceivedValue();
-    output(mySwitch.getReceivedValue(), mySwitch.getReceivedBitlength(), mySwitch.getReceivedDelay(), mySwitch.getReceivedRawdata(), mySwitch.getReceivedProtocol());
+  if (myRadioSignalSwitch.available()) {
+    lastRFvalue = myRadioSignalSwitch.getReceivedValue();
+    output(myRadioSignalSwitch.getReceivedValue(), myRadioSignalSwitch.getReceivedBitlength(), myRadioSignalSwitch.getReceivedDelay(), myRadioSignalSwitch.getReceivedRawdata(), myRadioSignalSwitch.getReceivedProtocol());
     // if (lastRFvalue == RM2_A_ON)  { delay(800); digitalWrite(LED_BUILTIN, HIGH); sendCode(true); }
     // if (lastRFvalue == RM2_A_OFF) { delay(800); digitalWrite(LED_BUILTIN, LOW);  sendCode(false); }
     delay(1);
-    mySwitch.resetAvailable();
+    myRadioSignalSwitch.resetAvailable();
   }
 
   if (lastRFvalue != previousRFvalue) {
@@ -670,10 +751,10 @@ void loop() {
   // -----------------------------------------------------
   if ((millis() - waterSensorsLastReadTickerMS) > getPreferredSensorRefreshFrequencyInSeconds() * 1000) {
     waterSensorsLastReadTickerMS = millis();
-    Serial.print("Time for analysis: ");
-    Serial.print("Frequency (sec): ");
-    Serial.print(getPreferredSensorRefreshFrequencyInSeconds());
-    Serial.print("  Elaspe: ");
+    Serial.print("Time for analysis! ");
+    Serial.print("Frequency: ");
+    Serial.print(getPreferredSensorRefreshFrequencyAsString());
+    Serial.print("  Elasped: ");
     Serial.print((millis() - waterSensorsLastReadTickerMS));
     Serial.println();
 
@@ -687,48 +768,109 @@ void loop() {
 
 }
 
-// CHANGE MODE button event handler
-void btnChangeModeHandleEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState) {
-  // Print out a message for all events.
-  Serial.print(F("btnChangeModeHandleEvent(): eventType: "));
-  Serial.print(eventType);
-  Serial.print(F("; buttonState: "));
-  Serial.println(buttonState);
 
+
+// MENU button has some event to look into...
+void btnMenuEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+  Serial.println("MENU: ");
   switch (eventType) {
     case AceButton::kEventClicked:
-      Serial.println("CHANGE MODE button clicked");
+      Serial.println("CLICK");
       switchToNextDisplayMode();
       break;
   }
 }
 
-// CHANGE MODE button event handler
-void btnOptionsHandleEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState) {
-  // Print out a message for all events.
-  Serial.print(F("btnOptionsHandleEvent(): eventType: "));
-  Serial.print(eventType);
-  Serial.print(F("; buttonState: "));
-  Serial.println(buttonState);
-
+// DEC/OPTIONS button has some event to look into...
+void btnDecOptionsEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+  Serial.print("DEC_OPTIONS: ");
   switch (eventType) {
     case AceButton::kEventClicked:
-      Serial.println("OPTIONS button clicked");
+      Serial.println("CLICK");
+      if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) {
+        Serial.print("SizeOf[]: ");
+        Serial.println(sizeof(waterSensorsReadFrequencyOptions) / sizeof(waterSensorsReadFrequencyOptions[0]));
+        if (waterSensorsReadFrequencySelection > 0) {
+          waterSensorsReadFrequencySelection--;
+        } else {
+          waterSensorsReadFrequencySelection = sizeof(waterSensorsReadFrequencyOptions) / sizeof(waterSensorsReadFrequencyOptions[0])-1;
+        }
+        Serial.print(waterSensorsReadFrequencySelected);
+        Serial.print("->");
+        Serial.println(waterSensorsReadFrequencySelection);
+        updateDisplay();
+      }
       break;
   }
 }
 
-// CHANGE MODE button event handler
-void btnConfirmHandleEvent(AceButton* /* button */, uint8_t eventType, uint8_t buttonState) {
-  // Print out a message for all events.
-  Serial.print(F("btnConfirmHandleEvent(): eventType: "));
-  Serial.print(eventType);
-  Serial.print(F("; buttonState: "));
-  Serial.println(buttonState);
-
+// INC/OPTIONS button has some event to look into...
+void btnIncOptionsEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+  Serial.print("INC_OPTIONS:");
   switch (eventType) {
     case AceButton::kEventClicked:
-      Serial.println("CONFIRM button clicked");
+      Serial.println("CLICK");
+      if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) {
+        Serial.print("SizeOf[]: ");
+        Serial.println(sizeof(waterSensorsReadFrequencyOptions));
+        if (waterSensorsReadFrequencySelection < (sizeof(waterSensorsReadFrequencyOptions) / sizeof(waterSensorsReadFrequencyOptions[0]))-1) {
+          waterSensorsReadFrequencySelection++;
+        } else {
+          waterSensorsReadFrequencySelection = 0;
+        }
+        updateDisplay();
+      }
+      break;
+  }
+}
+
+// CONFIRM button has some event to look into...
+void btnConfirmEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+  Serial.print("CONFIRM/CANCEL: ");
+  switch (eventType) {
+    case AceButton::kEventClicked:
+      Serial.println("CLICK");
+      if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) {
+        waterSensorsReadFrequencySelected = waterSensorsReadFrequencySelection;
+      }
+      DISPLAY_MODE = DISPLAY_MODE_OPERATIONS;
+      updateDisplay();
+      break;
+  }
+}
+
+// ACE BUTTONs event handler
+void btnHandleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+  uint8_t btnID = button->getId();
+  uint8_t btnPIN = button->getPin();
+  // Print out a message for all events.
+  // Serial.print(F("AceButton Event! "));
+  // Serial.print(F(" ID: "));
+  // Serial.print(btnID);
+  // Serial.print(F(" PIN: "));
+  // Serial.print(btnPIN);
+  // Serial.print(F(" EventType: "));
+  // Serial.print(eventType);
+  // Serial.print(F(" buttonState: "));
+  // Serial.println(buttonState);
+
+  // Call the right Button Handler based on PIN
+  switch (btnPIN) {
+    case BUTTON_MENU_PIN:
+      // Serial.println("MENU button event");
+      btnMenuEvent(button, eventType, buttonState);
+      break;
+    case BUTTON_DEC_OPTIONS_PIN:
+      // Serial.println("DEC_OPTIONS button event");
+      btnDecOptionsEvent(button, eventType, buttonState);
+      break;
+    case BUTTON_INC_OPTIONS_PIN:
+      // Serial.println("INC_OPTIONS button event");
+      btnIncOptionsEvent(button, eventType, buttonState);
+      break;
+    case BUTTON_CONFIRM_PIN:
+      // Serial.println("CONFIRM/CANCEL button event");
+      btnConfirmEvent(button, eventType, buttonState);
       break;
   }
 }
