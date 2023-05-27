@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RCSwitch.h>
@@ -12,7 +13,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-#define VERSION "v2.08"
+#define VERSION "v2.14"
 #define DEVICE_NAME "BKO-DMZ-DEV1"
 
 /// PIN Usage for this project
@@ -21,7 +22,8 @@
 //  |  2 | OUTPUT     | ESP32 Built-in LED                             |
 //  |  4 | INPUT      | Button: Menu                                   |
 //  |  5 | INPUT      | 433Mhz device (Receiver)                       |
-//  | 14 | OUTPUT     | Relay (Pump Public Klong)                      |
+//  | 12 | OUTPUT     | Pump Public Klong LED                          |
+//  | 14 | OUTPUT     | Pump Public Klong RELAY                        |
 //  | 15 | INPUT      | Button: Dec/Options                            |
 //  | 18 | INPUT      | Button: Inc/Options                            |
 //  | 19 | OUTPUT     | Meter Sensor Trigger pin (Public Klong)        |
@@ -69,9 +71,11 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 IPAddress IP;
 
 // DISPLAY MODE settings
-#define DISPLAY_MODE_OPERATIONS 0
-#define DISPLAY_MODE_WIFI       1
-#define DISPLAY_MODE_FREQUENCY_SETUP 2
+#define NUMBER_OF_DISPLAY_MODES         4
+#define DISPLAY_MODE_OPERATIONS         0
+#define DISPLAY_MODE_WIFI               1
+#define DISPLAY_MODE_FREQUENCY_SETUP    2
+#define DISPLAY_MODE_REBOOT             3
 int DISPLAY_MODE = 0;
 
 // WATER MEASURES settings
@@ -86,7 +90,7 @@ int   publicKlongSensor_VirtualZero = 25;     // Water distance from the sensor 
 float publicKlong_SensorWaterDistance = 0;    // In centimeters, the distance between the sensor and the water
 float publicKlong_CurrentWaterLevel = 0.0;    // In centimeters, the current relative water level from the virtual zero level. 
                                               // n > 0 = water is above target, n < 0 = water is below target
-int   publicKlong_PumpMinimumWaterLevel = 30;  // Distance from Sensor to water level needed to start tPUBLIC_KLONG_RELAY_PINhe pump safely
+int   publicKlong_PumpMinimumWaterLevel = 30;  // Distance from Sensor to water level needed to start the pump safely
 int   publicKlong_PumpDecision = 0;
 String systemAnalysis = "";
 // Provide options for how often we check water and make decisions
@@ -107,13 +111,15 @@ long duration;
 float distanceCm;
 
 // RELAY / PUMP Control settings
-#define PUBLIC_KLONG_RELAY_PIN  14
+#define PUBLIC_KLONG_RELAY_PIN      14
+#define PUBLIC_KLONG_RELAY_LED_PIN  12
 bool  publicKlong_powered = 0;
 float publicKlong_operating_time_min = 0.0; // Total minutes since the pump started
 unsigned long publicKlong_operating_time_sec = 0; // Total Seconds since the pump started
 unsigned long publicKlong_operating_start = 0;    // Current milliseconds when the pump started
 
 #define SOUTH_KLONG_RELAY_PIN  27
+#define SOUTH_KLONG_RELAY_LED_PIN  0
 bool  southKlong_powered = 0;
 float southKlong_operating_time_min = 0.0;  // Total minutes since the pump started
 unsigned long southKlong_operating_time_sec = 0;  // Total Seconds since the pump started
@@ -144,6 +150,11 @@ void displayStatus(void);
 void displayDeviceStatus(void);
 void updateWifiStatus(void);
 void updateDisplay(void);
+void displaySplashScreen(void);
+
+// Dynamic Preferences for all appropriate settings
+#define prefNameWaterSensorReadFrequency "waterSensReadFq"
+Preferences preferences;
 
 using namespace ace_button;
 // Initialize all smart buttons
@@ -198,7 +209,8 @@ void startPump1() {
   publicKlong_powered = 1;
   publicKlong_operating_start = millis();
   publicKlong_operating_time_sec = 0;
-  digitalWrite(PUBLIC_KLONG_RELAY_PIN, publicKlong_powered);
+  digitalWrite(PUBLIC_KLONG_RELAY_PIN, LOW);
+  digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
 }
 
 void stopPump1() {
@@ -206,7 +218,8 @@ void stopPump1() {
   publicKlong_powered = 0;
   publicKlong_operating_start = 0;
   publicKlong_operating_time_sec = 0;
-  digitalWrite(PUBLIC_KLONG_RELAY_PIN, publicKlong_powered);
+  digitalWrite(PUBLIC_KLONG_RELAY_PIN, HIGH);
+  digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
 }
 
 void startPump2() {
@@ -214,7 +227,8 @@ void startPump2() {
   southKlong_powered = 1;
   southKlong_operating_start = millis();
   southKlong_operating_time_sec = 0;
-  digitalWrite(SOUTH_KLONG_RELAY_PIN, southKlong_powered);
+  digitalWrite(SOUTH_KLONG_RELAY_PIN, LOW);
+  digitalWrite(SOUTH_KLONG_RELAY_LED_PIN, !digitalRead(SOUTH_KLONG_RELAY_PIN));
 }
 
 void stopPump2() {
@@ -222,7 +236,8 @@ void stopPump2() {
   southKlong_powered = 0;
   southKlong_operating_start = 0;
   southKlong_operating_time_sec = 0;
-  digitalWrite(SOUTH_KLONG_RELAY_PIN, southKlong_powered);
+  digitalWrite(SOUTH_KLONG_RELAY_PIN, HIGH);
+  digitalWrite(SOUTH_KLONG_RELAY_LED_PIN, !digitalRead(SOUTH_KLONG_RELAY_PIN));
 }
 
 #pragma endregion
@@ -352,12 +367,18 @@ void setup() {
   server.begin();
   Serial.println("HTTP server started");
 
-  // Configure Pump Relay PINs
+  // Configure Pump Relay and LED PINs
   pinMode(PUBLIC_KLONG_RELAY_PIN, OUTPUT);
-  pinMode(SOUTH_KLONG_RELAY_PIN, OUTPUT);
-  digitalWrite(PUBLIC_KLONG_RELAY_PIN, LOW);
-  digitalWrite(SOUTH_KLONG_RELAY_PIN, LOW);
+  pinMode(PUBLIC_KLONG_RELAY_LED_PIN, OUTPUT);
+  digitalWrite(PUBLIC_KLONG_RELAY_PIN, HIGH);
+  digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
 
+  pinMode(SOUTH_KLONG_RELAY_PIN, OUTPUT);
+  pinMode(SOUTH_KLONG_RELAY_LED_PIN, OUTPUT);
+  digitalWrite(SOUTH_KLONG_RELAY_PIN, HIGH);
+  digitalWrite(SOUTH_KLONG_RELAY_LED_PIN, !digitalRead(SOUTH_KLONG_RELAY_PIN));
+
+  // Onboard LED off by default
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
@@ -387,8 +408,13 @@ void setup() {
   pinMode(sensorSouthKlong_trigPin, OUTPUT); // Sets the sensorPublicKlong_trigPin as an Output
   pinMode(sensorSouthKlong_echoPin, INPUT); // Sets the sensorPublicKlong_echoPin as an Input
 
-  display.clearDisplay();
-  display.display();
+  // Handle Preferences
+  preferences.begin("bko_dmz_dev1", false);
+  waterSensorsReadFrequencySelected = preferences.getInt(prefNameWaterSensorReadFrequency, waterSensorsReadFrequencySelected);
+  Serial.print("Preferences Frequency Object Type:");
+  Serial.println(preferences.getType(prefNameWaterSensorReadFrequency));
+
+  displaySplashScreen();
 
   Serial.println("Initialized!");
 }
@@ -562,17 +588,50 @@ void displayInvalidDisplayMode(void) {
   display.display();
 }
 
+void displayRebootMenu(void) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, SSD_L1);
+  display.println("System Reboot");
+  display.println("");
+  display.println("");
+  display.println("CONFIRM to reboot");
+  
+  display.display();
+}
+
+void displaySplashScreen(void) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.setTextSize(2);
+  display.println("* B K O  *");
+  display.println("* GARDEN *");
+  display.println("* SYSTEM *");
+  display.setTextSize(1);
+  display.println();
+  display.print(VERSION);
+
+  display.display();
+  delay(4000);
+}
+
 void updateDisplay(void) {
   if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) displayDeviceStatus();
   else if (DISPLAY_MODE == DISPLAY_MODE_WIFI) displayWifiStatus();
   else if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) displayFrequencySetup();
+  else if (DISPLAY_MODE == DISPLAY_MODE_REBOOT) displayRebootMenu();
   else displayInvalidDisplayMode();
 }
 
 void switchToNextDisplayMode(void) {
   if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) DISPLAY_MODE = DISPLAY_MODE_WIFI;
   else if (DISPLAY_MODE == DISPLAY_MODE_WIFI) DISPLAY_MODE = DISPLAY_MODE_FREQUENCY_SETUP;
-  else if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) DISPLAY_MODE = -1;
+  else if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) DISPLAY_MODE = DISPLAY_MODE_REBOOT;
+  else if (DISPLAY_MODE == DISPLAY_MODE_REBOOT) DISPLAY_MODE = -1;
   else if (DISPLAY_MODE == -1) DISPLAY_MODE = DISPLAY_MODE_OPERATIONS;
   // Special actions when switching display mode
   if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) {
@@ -811,8 +870,6 @@ void btnIncOptionsEvent(AceButton* button, uint8_t eventType, uint8_t buttonStat
     case AceButton::kEventClicked:
       Serial.println("CLICK");
       if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) {
-        Serial.print("SizeOf[]: ");
-        Serial.println(sizeof(waterSensorsReadFrequencyOptions));
         if (waterSensorsReadFrequencySelection < (sizeof(waterSensorsReadFrequencyOptions) / sizeof(waterSensorsReadFrequencyOptions[0]))-1) {
           waterSensorsReadFrequencySelection++;
         } else {
@@ -824,7 +881,7 @@ void btnIncOptionsEvent(AceButton* button, uint8_t eventType, uint8_t buttonStat
   }
 }
 
-// CONFIRM button has some event to look into...
+// CONFIRM/CANCEL button clicked, action depends on current screen displayed
 void btnConfirmEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
   Serial.print("CONFIRM/CANCEL: ");
   switch (eventType) {
@@ -832,8 +889,17 @@ void btnConfirmEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) 
       Serial.println("CLICK");
       if (DISPLAY_MODE == DISPLAY_MODE_FREQUENCY_SETUP) {
         waterSensorsReadFrequencySelected = waterSensorsReadFrequencySelection;
+        int results = preferences.putInt(prefNameWaterSensorReadFrequency, waterSensorsReadFrequencySelected);
+        if (results == 0) {
+          Serial.println("Preferences: An error occured while saving Frequency settings");
+        } else {
+          Serial.println("Preferences: Frequency settings saved");
+        }
+        DISPLAY_MODE = DISPLAY_MODE_OPERATIONS;
       }
-      DISPLAY_MODE = DISPLAY_MODE_OPERATIONS;
+      if (DISPLAY_MODE == DISPLAY_MODE_REBOOT) {
+        ESP.restart();
+      }
       updateDisplay();
       break;
   }
@@ -841,8 +907,8 @@ void btnConfirmEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) 
 
 // ACE BUTTONs event handler
 void btnHandleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
-  uint8_t btnID = button->getId();
   uint8_t btnPIN = button->getPin();
+  // uint8_t btnID = button->getId();
   // Print out a message for all events.
   // Serial.print(F("AceButton Event! "));
   // Serial.print(F(" ID: "));
