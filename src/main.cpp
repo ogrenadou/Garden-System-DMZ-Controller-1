@@ -20,17 +20,17 @@
 //
 //  +----+------------+------------------------------------------------+
 //  |  2 | OUTPUT     | ESP32 Built-in LED                             |
-//  |  4 | INPUT      | Button: Menu                                   |
+//  |  4 | INPUT      | Button: Inc/Options                            |
 //  |  5 | INPUT      | 433Mhz device (Receiver)                       |
 //  | 12 | OUTPUT     | Pump Public Klong LED                          |
 //  | 14 | OUTPUT     | Pump Public Klong RELAY                        |
 //  | 15 | INPUT      | Button: Dec/Options                            |
-//  | 18 | INPUT      | Button: Inc/Options                            |
+//  | 18 | INPUT      | Button: Confirm/Cancel                         |
 //  | 19 | OUTPUT     | Meter Sensor Trigger pin (Public Klong)        |
 //  | 21 | <-->       | I2C Clock  (Used for LCD display)              |
 //  | 22 | <-->       | I2C Data   (Used for LCD display)              |
 //  | 25 | OUTPUT     | 433Mhz device (Transmitter)                    |
-//  | 26 | INPUT      | Button: Confirm/Cancel                         |
+//  | 26 | INPUT      | Button: Menu                                   |
 //  | 27 | OUTPUT     | Relay (Pump South Klong)  NOT IMPLEMENTED      |
 //  | 34 | INPUT      | Meter Sensor Echo pin (Public Klong)           |
 //  | -- |            | RTC Real-time Clock - Clock Pin                |
@@ -40,6 +40,21 @@
 //  | -- | IMPUT      | Needed for South Clong Meter Sensor (Echo)     |
 //  |    |            |                                                |
 //  +----+------------+------------------------------------------------+
+
+// REMOTE OPERATIONS
+//
+// http://192.18.4.1/update            --> OTA - Over The Air firmware update
+// http://192.18.4.1/setmin?lvl=30     --> Set Sensor-To-Pump distance (cm) as threshold to enable the pump
+
+// BUTTON OPERATIONS
+//
+//  [o] [o] [o] [o]
+//   |   |   |   |
+//   |   |   |   +----- OK / CONFIRM / CANCEL
+//   |   |   +--------- INCREASE / OPTION B
+//   |   +------------- DECREASE / OPTION A
+//   +----------------- MENU / SCREEN SELECTION 
+
 
 // LCD Screen Display settings
 // ---------------------------
