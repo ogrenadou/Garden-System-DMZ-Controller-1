@@ -13,7 +13,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-#define VERSION "v2.14"
+#define VERSION "v2.16"
 #define DEVICE_NAME "BKO-DMZ-DEV1"
 
 /// PIN Usage for this project
@@ -154,6 +154,8 @@ void displaySplashScreen(void);
 
 // Dynamic Preferences for all appropriate settings
 #define prefNameWaterSensorReadFrequency "waterSensReadFq"
+#define prefRequiredDistancePublicKlong  "waterSensMinLvl"
+#define prefRequiredDistancePublicKlong_default  30
 Preferences preferences;
 
 using namespace ace_button;
@@ -359,8 +361,32 @@ void setup() {
 
 
   // Initialize OTA (Over-The-Air ElegantOTA system)
+  // Start default webserver
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/plain", "Hi! I am ESP32.");
+  });
+  // Handle Set Minimum Water level required
+  server.on("/setmin", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    Serial.print("Web request /setmin");
+    String minLvl;
+    if (request->hasParam("lvl")) {
+      minLvl = request->getParam("lvl")->value();
+      publicKlong_PumpMinimumWaterLevel = minLvl.toInt();
+      int results = preferences.putInt(prefRequiredDistancePublicKlong, publicKlong_PumpMinimumWaterLevel);
+      if (results == 0) {
+        Serial.println("Preferences: An error occured while saving Minimum Water Level");
+      } else {
+        Serial.print("Preferences: Minimum Water Level saved: ");
+        Serial.println(minLvl);
+        Serial.print(" cm.");
+      }      
+    }
+    else {
+      minLvl = "Invalid request";
+    }
+    Serial.print("Web request /setmin: ");
+    Serial.println(minLvl);
+    request->send(200, "text/plain", "OK");
   });
 
   AsyncElegantOTA.begin(&server);    // Start ElegantOTA
@@ -411,8 +437,7 @@ void setup() {
   // Handle Preferences
   preferences.begin("bko_dmz_dev1", false);
   waterSensorsReadFrequencySelected = preferences.getInt(prefNameWaterSensorReadFrequency, waterSensorsReadFrequencySelected);
-  Serial.print("Preferences Frequency Object Type:");
-  Serial.println(preferences.getType(prefNameWaterSensorReadFrequency));
+  publicKlong_PumpMinimumWaterLevel = preferences.getInt(prefRequiredDistancePublicKlong, prefRequiredDistancePublicKlong_default);
 
   displaySplashScreen();
 
