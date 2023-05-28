@@ -13,7 +13,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-#define VERSION "v2.16"
+#define VERSION "v2.17"
 #define DEVICE_NAME "BKO-DMZ-DEV1"
 
 /// PIN Usage for this project
@@ -166,6 +166,7 @@ void displayDeviceStatus(void);
 void updateWifiStatus(void);
 void updateDisplay(void);
 void displaySplashScreen(void);
+void sendRF433MhzCode(int);
 
 // Dynamic Preferences for all appropriate settings
 #define prefNameWaterSensorReadFrequency "waterSensReadFq"
@@ -222,21 +223,25 @@ char * getPreferredSensorRefreshFrequencyAsString(int selectedIndex) {
 #pragma region Pump Controllers
 
 void startPump1() {
-  if (publicKlong_powered) return;  // Do nothing if already required state
+  int previousState = publicKlong_powered;
   publicKlong_powered = 1;
-  publicKlong_operating_start = millis();
-  publicKlong_operating_time_sec = 0;
+  sendRF433MhzCode(publicKlong_powered);
   digitalWrite(PUBLIC_KLONG_RELAY_PIN, LOW);
   digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
+  if (previousState == 1) return;  // Do nothing if it was already in required state
+  publicKlong_operating_start = millis();
+  publicKlong_operating_time_sec = 0;
 }
 
 void stopPump1() {
-  if (!publicKlong_powered) return;  // Do nothing if already required state
+  int previousState = publicKlong_powered;
   publicKlong_powered = 0;
-  publicKlong_operating_start = 0;
-  publicKlong_operating_time_sec = 0;
+  sendRF433MhzCode(publicKlong_powered);
   digitalWrite(PUBLIC_KLONG_RELAY_PIN, HIGH);
   digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
+  if (previousState == 0) return;  // Do nothing if already required state
+  publicKlong_operating_start = 0;
+  publicKlong_operating_time_sec = 0;
 }
 
 void startPump2() {
@@ -459,23 +464,25 @@ void setup() {
   Serial.println("Initialized!");
 }
 
-void sendCode(bool on) {
+
+// Send RF Code over 433Mhz
+void sendRF433MhzCode(int on) {
   myRadioSignalSwitch.setPulseLength(325);
   myRadioSignalSwitch.setProtocol(1);
   myRadioSignalSwitch.setRepeatTransmit(5);
 
-  Serial.print("Sending Code ");
+  Serial.print("Sending RF 433Mhz Code: ");
   Serial.println(on);
   
   if (on) 
-  { // RM2-B-ON
-    myRadioSignalSwitch.send("010000000001000101010001"); 
+  { // RM2-D-ON: Decimal: 4199697 (24Bit) Binary: 010000000001010100010001  
+    myRadioSignalSwitch.send("010000000001010100010001"); 
     virtualPlug2A = true;
     digitalWrite(LED_BUILTIN, HIGH);
   }     
   else 
-  { // RM2-B-OFF
-    myRadioSignalSwitch.send("010000000001000101010100"); 
+  { // RM2-D-OFF: Decimal: 4199700 (24Bit) Binary: 010000000001010100010100  
+    myRadioSignalSwitch.send("010000000001010100010100"); 
     virtualPlug2A = false;
     digitalWrite(LED_BUILTIN, LOW);
   }    
@@ -761,7 +768,7 @@ static char * dec2binWzerofill(unsigned long Dec, unsigned int bitLength) {
   return bin;
 }
 
-void output(unsigned long decimal, unsigned int length, unsigned int delay, unsigned int* raw, unsigned int protocol) {
+void debugRF433MhzOutput(unsigned long decimal, unsigned int length, unsigned int delay, unsigned int* raw, unsigned int protocol) {
   const char* b = dec2binWzerofill(decimal, length);
   Serial.print("Decimal: ");
   Serial.print(decimal);
@@ -822,9 +829,9 @@ void loop() {
   // Handle 433Mhz Communication Events
   if (myRadioSignalSwitch.available()) {
     lastRFvalue = myRadioSignalSwitch.getReceivedValue();
-    output(myRadioSignalSwitch.getReceivedValue(), myRadioSignalSwitch.getReceivedBitlength(), myRadioSignalSwitch.getReceivedDelay(), myRadioSignalSwitch.getReceivedRawdata(), myRadioSignalSwitch.getReceivedProtocol());
-    // if (lastRFvalue == RM2_A_ON)  { delay(800); digitalWrite(LED_BUILTIN, HIGH); sendCode(true); }
-    // if (lastRFvalue == RM2_A_OFF) { delay(800); digitalWrite(LED_BUILTIN, LOW);  sendCode(false); }
+    debugRF433MhzOutput(myRadioSignalSwitch.getReceivedValue(), myRadioSignalSwitch.getReceivedBitlength(), myRadioSignalSwitch.getReceivedDelay(), myRadioSignalSwitch.getReceivedRawdata(), myRadioSignalSwitch.getReceivedProtocol());
+    // if (lastRFvalue == RM2_A_ON)  { delay(800); digitalWrite(LED_BUILTIN, HIGH); sendRF433MhzCode(true); }
+    // if (lastRFvalue == RM2_A_OFF) { delay(800); digitalWrite(LED_BUILTIN, LOW);  sendRF433MhzCode(false); }
     delay(1);
     myRadioSignalSwitch.resetAvailable();
   }
