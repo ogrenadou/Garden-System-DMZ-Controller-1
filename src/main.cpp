@@ -13,8 +13,8 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-#define VERSION "v2.17"
-#define DEVICE_NAME "BKO-DMZ-DEV1"
+String  VERSION = "v2.26";
+String  DEVICE_NAME = "BKO-DMZ-DEV1";
 
 /// PIN Usage for this project
 //
@@ -114,6 +114,18 @@ int   waterSensorsReadFrequencyOptions[] = { 1, 5, 10, 15, 30, 60, 2 * 60, 5 * 6
 int   waterSensorsReadFrequencySelected = 5;  // The INDEX of the option selected (default index 5: 1 minute)
 int   waterSensorsReadFrequencySelection = waterSensorsReadFrequencySelected;  // The INDEX of the option selected
 unsigned long waterSensorsLastReadTickerMS = 0;
+bool  needRevaluationOfSituation = false;
+
+#define master_mode_automated "AUTO"
+#define master_mode_forced_off "FORCED OFF"
+#define master_mode_forced_on   "FORCED ON"
+String master_operations_mode = master_mode_automated;
+
+
+#define MASTER_MODE_PUBLIC_PUMP_MANUAL_OFF
+#define MASTER_MODE_PUBLIC_PUMP_MANUAL_ON
+
+
 
 // MEASURE SENSORS settings (Ultrasonic SR04 Distance Sensor)
 #define SOUND_SPEED 0.034
@@ -171,6 +183,7 @@ void sendRF433MhzCode(int);
 // Dynamic Preferences for all appropriate settings
 #define prefNameWaterSensorReadFrequency "waterSensReadFq"
 #define prefRequiredDistancePublicKlong  "waterSensMinLvl"
+#define prefMasterOperationsMode         "masterOpsMode"
 #define prefRequiredDistancePublicKlong_default  30
 Preferences preferences;
 
@@ -312,31 +325,25 @@ void analyzeWaterLevels() {
   if (publicKlong_PumpMinimumWaterLevel > publicKlong_SensorWaterDistance) {
     publicKlong_PumpDecision = 1;
     systemAnalysis = "OK to pump!";
-    startPump1();
-    return;
   } else {
     publicKlong_PumpDecision = 0;
     systemAnalysis = "Water TOO LOW to pump";
+  }
+
+  // Override any decision if operations mode has been set to ON or OFF
+  if (master_operations_mode ==  master_mode_forced_on) {
+    publicKlong_PumpDecision = 1;
+  } else if (master_operations_mode ==  master_mode_forced_off) {
+    publicKlong_PumpDecision = 0;
+  }
+
+  if (publicKlong_PumpDecision) {
+    startPump1();
+    return;
+  } else {
     stopPump1();
     return;
   }
-  
-  // Fancy version when I can measure South Klong to avoid overflow
-  // if (southKlong_CurrentWaterLevel >= 0) {
-  //   publicKlong_PumpDecision = 0;
-  //   systemAnalysis = "All set!";
-  //   stopPump1();
-  // } else { 
-  //   if (publicKlong_SensorWaterDistance < publicKlong_PumpMinimumWaterLevel) {
-  //     publicKlong_PumpDecision = 1;
-  //     systemAnalysis = "Pump!";
-  //     startPump1();
-  //   } else {
-  //     publicKlong_PumpDecision = -1;
-  //     systemAnalysis = "Cant Pump";
-  //     stopPump1();
-  //   }
-  // }
 
   // Nothing has been decided at this point (BUG!!!)
   // Let's turn the pump OFF to be safe
@@ -344,6 +351,169 @@ void analyzeWaterLevels() {
   systemAnalysis = "!!! Cannot decide !!!";
   stopPump1();
 }
+
+void handleMasterOperationsChoice(String opsmode) {
+  if (opsmode == master_mode_forced_on) {
+    Serial.println("Switch the system to FORCED ON mode");
+    startPump1();
+  } else if (opsmode == master_mode_forced_off) {
+    Serial.println("Switch the system to FORCED OFF mode");
+    stopPump1();
+  } else {
+    Serial.println("Switch the system to AUTO mode");
+    // opsmode == master_mode_automated 
+    // Do nothing here, the next Loop cycle will take care of everything
+  }
+}
+
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <title>BKO Garden System</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <style>
+    html {font-family: Arial; display: inline-block; text-align: center;}
+    h2 {font-size: 3.0rem;}
+    p {font-size: 3.0rem;}
+    body {max-width: 600px; margin:0px auto; padding-bottom: 25px;}
+    .switch {position: relative; display: inline-block; width: 120px; height: 68px} 
+    .switch input {display: none}
+    .slider {position: absolute; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; border-radius: 6px}
+    .slider:before {position: absolute; content: ""; height: 52px; width: 52px; left: 8px; bottom: 8px; background-color: #fff; -webkit-transition: .4s; transition: .4s; border-radius: 3px}
+    input:checked+.slider {background-color: #b30000}
+    input:checked+.slider:before {-webkit-transform: translateX(52px); -ms-transform: translateX(52px); transform: translateX(52px)}
+    table {border-collapse: collapse;margin-left:auto;margin-right:auto;}
+    td, th {border: 1px solid #dddddd; text-align: left; padding: 8px;}
+    tr:nth-child(even) { background-color: #dddddd; }
+  </style>
+</head>
+<body>
+  <h2>BKO Garden System</h2>
+  %VERSIONPLACEHOLDER%
+  <br/>
+  %OPERATINGMODEPLACEHOLDER%
+  <br/>
+  %WATERLIMITPLACEHOLDER%
+  <br/>
+  %PUMPSTATUSPLACEHOLDER%
+  <br/>
+  %SYSTEMSTATUSPLACEHOLDER%
+  <br/>
+  %FIRMWAREPLACEHOLDER%
+</body>
+</html>
+)rawliteral";
+
+// Replaces placeholder with button section in your web page
+String htmlProcessor(const String& var){
+  // Serial.print("HTML Processor for: ");
+  // Serial.println(var);
+
+  if (var == "VERSIONPLACEHOLDER"){
+    String version = "";
+    version += DEVICE_NAME + "<br/>" + VERSION + "<br/>";
+    return version;
+  }
+  
+  if (var == "OPERATINGMODEPLACEHOLDER"){
+    String html = "";
+    html += "Operating Mode: " + master_operations_mode + "<br/>";
+    html += "<a href='/mastermode?mode=on'>Force ON</a> ";
+    html += "<a href='/mastermode?mode=off'>Force OFF</a> ";
+    html += "<a href='/mastermode?mode=auto'>AUTO</a><br/>";
+    html += "<br/>";
+    return html;
+  }
+  
+  if (var == "WATERLIMITPLACEHOLDER"){
+    String html = "";
+  
+    html += "<form action='/setmin'>";
+    html += "<label for='lvl'>Min Level:</label> ";
+    html += "<input type='text' style='width:30px' id='flvl' name='lvl' value='" + String(publicKlong_PumpMinimumWaterLevel) + "'> cm ";
+    html += "<input type='submit' value='Update'>";
+    html += "</form>";
+    return html;
+  }
+  
+  if (var == "PUMPSTATUSPLACEHOLDER"){
+    String html = "";
+    if  (publicKlong_PumpDecision == 1) {
+    html += "<div style='width:280px;margin:auto;background:green;color:white;padding:5px 5px 5px 5px;'>Pumping</div><br/>";
+    } else {
+      if ( master_operations_mode == master_mode_forced_off) {
+        html += "<div style='width:280px;margin:auto;background:red;color:white;padding:5px 5px 5px 5px;'>Not pumping</div><br/>";
+      } else {
+        html += "<div style='width:280px;margin:auto;background:grey;color:black;padding:5px 5px 5px 5px;'>Not pumping</div><br/>";
+      }
+    }
+    return html;
+  }
+
+  if (var == "SYSTEMSTATUSPLACEHOLDER"){
+    String html = "";
+    html += "<table>";
+    html += "  <tr>";
+    html += "    <td>Frequency:</td>";
+    html += "    <td>" + String(getPreferredSensorRefreshFrequencyAsString()) + "</td>";
+    html += "  </tr>";
+    html += "  <tr>";
+    html += "    <td>Required:</td>";
+    html += "    <td>" + String(publicKlong_PumpMinimumWaterLevel) + " cm</td>";
+    html += "  </tr>";
+    html += "  <tr>";
+    html += "    <td>Sensor:</td>";
+    html += "    <td>" + String(publicKlong_SensorWaterDistance) + "</td>";
+    html += "  </tr>";
+
+    html += "  <tr>";
+    html += "  <td>Pump:</td>";
+    if (publicKlong_PumpDecision == 1) {
+      html += "  <td>";
+      if (master_operations_mode == master_mode_forced_on) {
+        html += "Forced ON";
+      } else {
+        html += "ON";
+      }
+      html += " (";
+      html += String(publicKlong_operating_time_min);
+      html += " min)";
+      html += "</td>";
+    } else {
+      html += "<td>";
+      if (master_operations_mode == master_mode_forced_off) {
+        html += "Forced OFF";
+      } else {
+        html += "OFF";
+      }
+      html += "</td>";
+    }
+    html += "  </tr>";
+
+    html += "  <tr>";
+    html += "    <td>Status:</td>";
+    html += "    <td>" + systemAnalysis + "</td>";
+    html += "  </tr>";
+
+    html += "</table>";
+    Serial.println(html);
+    return html;
+  }
+  
+  if (var == "FIRMWAREPLACEHOLDER") {
+    String html = "";
+    html += "<br/>";
+    html += "Firmware: " + String(__DATE__) + " " + String(__TIME__) + "<br/>";
+    html += "<a href='/update'>Update Firmware</a>";
+    return html;
+  }
+  
+  return String();
+}
+
+
 
 // ***********************
 // *****  S E T U P  *****
@@ -383,11 +553,50 @@ void setup() {
   // Initialize OTA (Over-The-Air ElegantOTA system)
   // Start default webserver
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/plain", "Hi! I am ESP32.");
+    request->send_P(200, "text/html", index_html, htmlProcessor);
+    // request->send(200, "text/plain", "Hi! I am ESP32.");
   });
+
+  // Handle Set Master Operations Mode
+  server.on("/mastermode", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    Serial.print("Web request /mastermode");
+    needRevaluationOfSituation = true;  // Always re-evaluate everything after a web page request
+    String opsMode;
+    String msg;
+    if (request->hasParam("mode")) {
+      opsMode = request->getParam("mode")->value();
+      Serial.print("Web request /mastermode: ");
+      Serial.println(opsMode);
+      if (opsMode == "on") master_operations_mode = master_mode_forced_on;
+      else if (opsMode == "off") master_operations_mode = master_mode_forced_off;
+      else if (opsMode == "auto") master_operations_mode = master_mode_automated;
+      else {
+        master_operations_mode = master_mode_automated;
+        msg = "INVALID REQUEST:  /mastermode?mode=xx Valid values are on / off / auto";
+        request->send(200, "text/plain", msg);
+        return;
+      }
+      int results = preferences.putString(prefMasterOperationsMode, master_operations_mode);
+      if (results == 0) {
+        Serial.println("Preferences: An error occured while saving Master Operations Mode");
+      } else {
+        Serial.print("Preferences: Master Operations Mode saved: ");
+        Serial.print(opsMode);
+      }      
+    }
+    else {
+      String msg = "Invalid request, ?mode=xx parameter is required!";
+      request->send(200, "text/plain", msg);
+      return;
+    }
+    analyzeWaterLevels();
+    request->redirect("/");
+  });
+
   // Handle Set Minimum Water level required
   server.on("/setmin", HTTP_GET, [] (AsyncWebServerRequest *request) {
     Serial.print("Web request /setmin");
+    needRevaluationOfSituation = true;  // Always re-evaluate everything after a web page request
     String minLvl;
     if (request->hasParam("lvl")) {
       minLvl = request->getParam("lvl")->value();
@@ -402,11 +611,13 @@ void setup() {
       }      
     }
     else {
-      minLvl = "Invalid request";
+      String msg = "Invalid request: ?lvl=xx parameter is required!";
+      request->send(200, "text/plain", msg);
+      return;
     }
-    Serial.print("Web request /setmin: ");
+    Serial.print("Web request /setmin: New level set to ");
     Serial.println(minLvl);
-    request->send(200, "text/plain", "OK");
+    request->redirect("/");
   });
 
   AsyncElegantOTA.begin(&server);    // Start ElegantOTA
@@ -458,7 +669,7 @@ void setup() {
   preferences.begin("bko_dmz_dev1", false);
   waterSensorsReadFrequencySelected = preferences.getInt(prefNameWaterSensorReadFrequency, waterSensorsReadFrequencySelected);
   publicKlong_PumpMinimumWaterLevel = preferences.getInt(prefRequiredDistancePublicKlong, prefRequiredDistancePublicKlong_default);
-
+  master_operations_mode = preferences.getString(prefMasterOperationsMode, master_operations_mode);
   displaySplashScreen();
 
   Serial.println("Initialized!");
@@ -552,13 +763,23 @@ void displayDeviceStatus(void) {
   display.setCursor(0, SSD_L6);
   display.print("Pump:");
   if (publicKlong_PumpDecision == 1) {
-    display.print("ON");
+    if (master_operations_mode == master_mode_forced_on) {
+      display.print("F-ON");
+      systemAnalysis = "*** Pump FORCED ON";
+    } else {
+      display.print("ON");
+    }
     display.setCursor(64, SSD_L6);
     display.print(" ");
     display.print(publicKlong_operating_time_min);
     display.print(" min");
   } else {
-    display.print("OFF");
+    if (master_operations_mode == master_mode_forced_off) {
+      display.print("F-OFF");
+      systemAnalysis = "*** FORCE OFFLINE";
+    } else {
+      display.print("OFF");
+    }
   }
 
   // display.print("Mode:");
@@ -663,6 +884,7 @@ void displaySplashScreen(void) {
   display.print(VERSION);
 
   display.display();
+  Serial.println("Waiting for Slash Screen on LCD display");
   delay(4000);
 }
 
@@ -855,8 +1077,10 @@ void loop() {
   // Handle the Timer for Water Sensor analysis & Decision
   // based on preferred frequency settings
   // -----------------------------------------------------
-  if ((millis() - waterSensorsLastReadTickerMS) > getPreferredSensorRefreshFrequencyInSeconds() * 1000) {
+  if ((millis() - waterSensorsLastReadTickerMS) > getPreferredSensorRefreshFrequencyInSeconds() * 1000
+      || needRevaluationOfSituation) {
     waterSensorsLastReadTickerMS = millis();
+    needRevaluationOfSituation = false;
     Serial.print("Time for analysis! ");
     Serial.print("Frequency: ");
     Serial.print(getPreferredSensorRefreshFrequencyAsString());
