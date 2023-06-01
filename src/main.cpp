@@ -13,7 +13,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-String  VERSION = "v2.26";
+String  VERSION = "v2.25";
 String  DEVICE_NAME = "BKO-DMZ-DEV1";
 
 /// PIN Usage for this project
@@ -308,33 +308,25 @@ void analyzeWaterLevels() {
 
   updatePumpTimers();
 
-  // Cannot make decisions if the sensors returns unrealistic numbers
-  // If so, turn off the pump for safety
-  if ( publicKlong_SensorWaterDistance > 300 || publicKlong_SensorWaterDistance < 5) {
-    // stopPump1();
-    // stopPump2();
-    systemAnalysis = "Invalid measure!";
-    // Keep the pump as it was
-    return;
-  }
-
   // Check water levels to make decisions:
   // - If South Klong is full, no need to pump
   // - If South Klong needs wather, check if there is enough water in Public Klong to operate the pump
-
-  if (publicKlong_PumpMinimumWaterLevel > publicKlong_SensorWaterDistance) {
-    publicKlong_PumpDecision = 1;
-    systemAnalysis = "OK to pump!";
-  } else {
-    publicKlong_PumpDecision = 0;
-    systemAnalysis = "Water TOO LOW to pump";
-  }
-
   // Override any decision if operations mode has been set to ON or OFF
   if (master_operations_mode ==  master_mode_forced_on) {
     publicKlong_PumpDecision = 1;
   } else if (master_operations_mode ==  master_mode_forced_off) {
     publicKlong_PumpDecision = 0;
+  } else if ( publicKlong_SensorWaterDistance > 300 || publicKlong_SensorWaterDistance < 5) {
+    // Cannot make decisions if the sensors returns unrealistic numbers
+    // If so, stay as it currently is (pumping or not pumping)
+    // The Max Time Pumping should protect from a forever-invalid reading
+    systemAnalysis = "Invalid measure!";
+  } else if (publicKlong_PumpMinimumWaterLevel > publicKlong_SensorWaterDistance) {
+    publicKlong_PumpDecision = 1;
+    systemAnalysis = "OK to pump!";
+  } else {
+    publicKlong_PumpDecision = 0;
+    systemAnalysis = "Water TOO LOW to pump";
   }
 
   if (publicKlong_PumpDecision) {
@@ -444,9 +436,9 @@ String htmlProcessor(const String& var){
     html += "<div style='width:280px;margin:auto;background:green;color:white;padding:5px 5px 5px 5px;'>Pumping</div><br/>";
     } else {
       if ( master_operations_mode == master_mode_forced_off) {
-        html += "<div style='width:280px;margin:auto;background:red;color:white;padding:5px 5px 5px 5px;'>Not pumping</div><br/>";
+        html += "<div style='width:280px;margin:auto;background:grey;color:white;padding:5px 5px 5px 5px;'>SYSTEM OFFLINE</div><br/>";
       } else {
-        html += "<div style='width:280px;margin:auto;background:grey;color:black;padding:5px 5px 5px 5px;'>Not pumping</div><br/>";
+        html += "<div style='width:280px;margin:auto;background:red;color:white;padding:5px 5px 5px 5px;'>Not pumping</div><br/>";
       }
     }
     return html;
