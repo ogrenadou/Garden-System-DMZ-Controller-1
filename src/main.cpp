@@ -13,7 +13,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-String  VERSION = "v2.25";
+String  VERSION = "v2.31";
 String  DEVICE_NAME = "BKO-DMZ-DEV1";
 
 /// PIN Usage for this project
@@ -73,7 +73,7 @@ String  DEVICE_NAME = "BKO-DMZ-DEV1";
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // WIFI settings
-#define DEV_WIFI_MODE_AP   // DEV_WIFI_MODE_AP or DEV_WIFI_MODE_STATION
+// #define DEV_WIFI_MODE_AP   // DEV_WIFI_MODE_AP or DEV_WIFI_MODE_STATION
 #ifdef DEV_WIFI_MODE_AP
   const char* ssid = "BKO-GARDEN-DMZ-DEV1";
   const char* password = "BKOGARDEN123*";
@@ -201,6 +201,7 @@ void btnHandleEvent(AceButton*, uint8_t, uint8_t);
 
 // Initialize Async Web Server used by OTA (and maybe other stuff)
 AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
 
 int getPreferredSensorRefreshFrequencyInSeconds() {
@@ -394,6 +395,45 @@ const char index_html[] PROGMEM = R"rawliteral(
   %SYSTEMSTATUSPLACEHOLDER%
   <br/>
   %FIRMWAREPLACEHOLDER%
+<script>
+  var gateway = `ws://${window.location.hostname}/ws`;
+  var websocket;
+  window.addEventListener('load', onLoad);
+  function initWebSocket() {
+    console.log('Trying to open a WebSocket connection...');
+    websocket = new WebSocket(gateway);
+    websocket.onopen    = onOpen;
+    websocket.onclose   = onClose;
+    websocket.onmessage = onMessage; // <-- add this line
+  }
+  function onOpen(event) {
+    console.log('Connection opened');
+  }
+  function onClose(event) {
+    console.log('Connection closed');
+    setTimeout(initWebSocket, 2000);
+  }
+  function onMessage(event) {
+    console.log('WS On Message:' + event.data);
+    msg = JSON.parse(event.data)
+    var sensorLevel = msg.sensor;
+    var frequency = msg.frequency;
+    var minlvl = msg.minlvl;
+    document.getElementById('sensor').innerHTML = sensorLevel + " cm";
+    document.getElementById('frequency').innerHTML = frequency;
+    document.getElementById('minlvl').innerHTML = minlvl + " cm";
+  }
+  function onLoad(event) {
+    initWebSocket();
+    initButton();
+  }
+  function initButton() {
+    //document.getElementById('button').addEventListener('click', toggle);
+  }
+  function toggle(){
+    websocket.send('toggle');
+  }
+</script>  
 </body>
 </html>
 )rawliteral";
@@ -449,15 +489,35 @@ String htmlProcessor(const String& var){
     html += "<table>";
     html += "  <tr>";
     html += "    <td>Frequency:</td>";
-    html += "    <td>" + String(getPreferredSensorRefreshFrequencyAsString()) + "</td>";
+    html += "    <td><span id='frequency'>" + String(getPreferredSensorRefreshFrequencyAsString()) + "</span> ";
+    html += "       <form action='/frequency'>";
+    html += "         <select name='freq' id='freq'>";
+    html += "           <option value='0'>1 sec</option>";
+    html += "           <option value='1'>5 sec</option>";
+    html += "           <option value='2'>10 sec</option>";
+    html += "           <option value='3'>15 sec</option>";
+    html += "           <option value='4'>30 sec</option>";
+    html += "           <option value='5'>1 min</option>";
+    html += "           <option value='6'>2 min</option>";
+    html += "           <option value='7'>5 min</option>";
+    html += "           <option value='8'>10 min</option>";
+    html += "           <option value='9'>15 min</option>";
+    html += "           <option value='10'>30 min</option>";
+    html += "           <option value='11'>45 min</option>";
+    html += "           <option value='12'>1 hr</option>";
+    html += "           <option value='13'>2 hrs</option>";
+    html += "         </select>";
+    html += "       <input type='submit' value='Set'>";
+    html += "     </form>";
+    html += "    </td>";
     html += "  </tr>";
     html += "  <tr>";
     html += "    <td>Required:</td>";
-    html += "    <td>" + String(publicKlong_PumpMinimumWaterLevel) + " cm</td>";
+    html += "    <td id='minlvl'>" + String(publicKlong_PumpMinimumWaterLevel) + " cm</td>";
     html += "  </tr>";
     html += "  <tr>";
     html += "    <td>Sensor:</td>";
-    html += "    <td>" + String(publicKlong_SensorWaterDistance) + "</td>";
+    html += "    <td id='sensor'>" + String(publicKlong_SensorWaterDistance) + "</td>";
     html += "  </tr>";
 
     html += "  <tr>";
@@ -490,7 +550,7 @@ String htmlProcessor(const String& var){
     html += "  </tr>";
 
     html += "</table>";
-    Serial.println(html);
+    // Serial.println(html);
     return html;
   }
   
@@ -498,13 +558,60 @@ String htmlProcessor(const String& var){
     String html = "";
     html += "<br/>";
     html += "Firmware: " + String(__DATE__) + " " + String(__TIME__) + "<br/>";
-    html += "<a href='/update'>Update Firmware</a>";
+    html += "<a href='/update'>Update Firmware</a><br/>";
+    html += "<a href='/reboot'>Reboot</a>";
     return html;
   }
   
   return String();
 }
 
+// WEBSOCKET functions
+// -------------------
+void notifyClients() {
+  Serial.println("WebSocket: Notify Clients");
+  String json = "";
+  json += "{";
+  json += "\"sensor\":" + String(publicKlong_SensorWaterDistance);
+  json += ",\"frequency\":\"" + String(getPreferredSensorRefreshFrequencyAsString()) + "\"";
+  json += ",\"minlvl\":\"" + String(publicKlong_PumpMinimumWaterLevel) + "\"";
+  json += "}";
+  ws.textAll(json);
+}
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+  AwsFrameInfo *info = (AwsFrameInfo*)arg;
+  if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+    data[len] = 0;
+    if (strcmp((char*)data, "toggle") == 0) {
+      // ledState = !ledState;
+      notifyClients();
+    }
+  }
+}
+
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len) {
+  switch (type) {
+    case WS_EVT_CONNECT:
+      Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+      break;
+    case WS_EVT_DISCONNECT:
+      Serial.printf("WebSocket client #%u disconnected\n", client->id());
+      break;
+    case WS_EVT_DATA:
+      handleWebSocketMessage(arg, data, len);
+      break;
+    case WS_EVT_PONG:
+    case WS_EVT_ERROR:
+      break;
+  }
+}
+
+void initWebSocket() {
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+}
 
 
 // ***********************
@@ -516,8 +623,22 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("Initialize...");
-  
-  #ifdef DEV_WIFI_MODE_STATION
+
+  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;); // Don't proceed, loop forever
+  }
+  displaySplashScreen();
+
+  #ifdef DEV_WIFI_MODE_AP
+    // Inisitalize WIFI as an ACCESS POINT (AP)
+    Serial.println("WIFI operating as ACCESS POINT (AP) mode.");
+    WiFi.softAP(ssid, password);
+    IP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(IP);
+  #else
     // Initialize WIFI as a STATION (Client) and wait for connection
     Serial.println("WIFI operating as STATION mode.");
     WiFi.mode(WIFI_STA);
@@ -527,26 +648,54 @@ void setup() {
       delay(500);
       Serial.print(".");
     }
+    IP = WiFi.localIP();
     Serial.println("");
     Serial.print("Connected to ");
     Serial.println(ssid);
     Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-  #else
-  // Inisitalize WIFI as an ACCESS POINT (AP)
-    Serial.println("WIFI operating as ACCESS POINT (AP) mode.");
-    WiFi.softAP(ssid, password);
-    IP = WiFi.softAPIP();
-    Serial.print("AP IP address: ");
     Serial.println(IP);
   #endif
 
+  // Initialize WebSocket support
+  initWebSocket();
 
   // Initialize OTA (Over-The-Air ElegantOTA system)
   // Start default webserver
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", index_html, htmlProcessor);
     // request->send(200, "text/plain", "Hi! I am ESP32.");
+  });
+
+  // Support Reboot ESP32 from web page
+  server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->redirect("/");
+    delay(1000);
+    ESP.restart();
+  });
+
+  // Handle Set Frequency
+  server.on("/frequency", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    Serial.print("Web request /frequency");
+    needRevaluationOfSituation = true;  // Always re-evaluate everything after a web page request
+    String fq;
+    if (request->hasParam("freq")) {
+      fq = request->getParam("freq")->value();
+      waterSensorsReadFrequencySelected = fq.toInt();
+      int results = preferences.putInt(prefNameWaterSensorReadFrequency, waterSensorsReadFrequencySelected);
+      if (results == 0) {
+        Serial.println("Preferences: An error occured while saving Frequency settings");
+      } else {
+        Serial.println("Preferences: Frequency settings saved");
+      }     
+    }
+    else {
+      String msg = "Invalid request: ?freq=xx parameter is required!";
+      request->send(200, "text/plain", msg);
+      return;
+    }
+    Serial.print("Web request /frequency: New frequency set to (index) ");
+    Serial.println(waterSensorsReadFrequencySelected);
+    request->redirect("/");
   });
 
   // Handle Set Master Operations Mode
@@ -642,12 +791,6 @@ void setup() {
   buttonConfig->setFeature(ButtonConfig::kFeatureDoubleClick);
   buttonConfig->setFeature(ButtonConfig::kFeatureLongPress);
 
-  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
-  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;); // Don't proceed, loop forever
-  }
-
   myRadioSignalSwitch.enableReceive(GPIO_RF_PIN);  // Receiver input on interrupt 0 (D2) OR D3???
   myRadioSignalSwitch.enableTransmit(GPIO_TRANSMIT_PIN);  
 
@@ -662,8 +805,8 @@ void setup() {
   waterSensorsReadFrequencySelected = preferences.getInt(prefNameWaterSensorReadFrequency, waterSensorsReadFrequencySelected);
   publicKlong_PumpMinimumWaterLevel = preferences.getInt(prefRequiredDistancePublicKlong, prefRequiredDistancePublicKlong_default);
   master_operations_mode = preferences.getString(prefMasterOperationsMode, master_operations_mode);
-  displaySplashScreen();
 
+  delay(2000); // Wait a bit more here as we show the splash screen
   Serial.println("Initialized!");
 }
 
@@ -759,7 +902,7 @@ void displayDeviceStatus(void) {
       display.print("F-ON");
       systemAnalysis = "*** Pump FORCED ON";
     } else {
-      display.print("ON");
+      display.print("ON (A)");
     }
     display.setCursor(64, SSD_L6);
     display.print(" ");
@@ -770,7 +913,7 @@ void displayDeviceStatus(void) {
       display.print("F-OFF");
       systemAnalysis = "*** FORCE OFFLINE";
     } else {
-      display.print("OFF");
+      display.print("OFF (AUTO)");
     }
   }
 
@@ -877,7 +1020,6 @@ void displaySplashScreen(void) {
 
   display.display();
   Serial.println("Waiting for Slash Screen on LCD display");
-  delay(4000);
 }
 
 void updateDisplay(void) {
@@ -1039,6 +1181,7 @@ void loop() {
   btnDecOptions.check();
   btnIncOptions.check();
   btnConfirm.check();
+  ws.cleanupClients();
 
   // Handle 433Mhz Communication Events
   if (myRadioSignalSwitch.available()) {
@@ -1064,6 +1207,7 @@ void loop() {
     calculateWaterLevels();
     updatePumpTimers();
     updateDisplay();
+    notifyClients();
   }
   
   // Handle the Timer for Water Sensor analysis & Decision
@@ -1086,6 +1230,8 @@ void loop() {
     calculateWaterLevels();
     analyzeWaterLevels();
     updateDisplay();
+
+    // notifyClients();
   }
 
 }
