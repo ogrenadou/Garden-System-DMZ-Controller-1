@@ -13,7 +13,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-String  VERSION = "v2.31";
+String  VERSION = "v2.34";
 String  DEVICE_NAME = "BKO-DMZ-DEV1";
 
 /// PIN Usage for this project
@@ -419,10 +419,35 @@ const char index_html[] PROGMEM = R"rawliteral(
     var sensorLevel = msg.sensor;
     var frequency = msg.frequency;
     var minlvl = msg.minlvl;
+    var opsmode = msg.opsmode;
+    var sysanalysis = msg.sysanalysis;
+    var powerpk = msg.powerpk;
+    var powerpktimer = msg.powerpktimer;
     document.getElementById('sensor').innerHTML = sensorLevel + " cm";
     document.getElementById('frequency').innerHTML = frequency;
     document.getElementById('minlvl').innerHTML = minlvl + " cm";
+    document.getElementById('opsmode').innerHTML = opsmode;
+    document.getElementById('sysanalysis').innerHTML = sysanalysis;
+    elempumpstatus = document.getElementById('pumpstatus');
+    elempumpstatusbar = document.getElementById('pumpstatusbar');
+    if (opsmode == "AUTO" && powerpk == 1) {
+      elempumpstatus.innerHTML = "ON (" + powerpktimer + " min)";
+      elempumpstatusbar.innerHTML = "<div style='width:280px;margin:auto;background:green;color:white;padding:5px 5px 5px 5px;'>Pumping</div><br/>";
+    } else if (opsmode == "AUTO" && powerpk == 0) {
+      elempumpstatus.innerHTML = "OFF";
+      elempumpstatusbar.innerHTML = "<div style='width:280px;margin:auto;background:red;color:white;padding:5px 5px 5px 5px;'>Not pumping</div><br/>";
+    } else if (opsmode == "FORCED OFF") {
+      elempumpstatus.innerHTML = "Forced OFF";
+      elempumpstatusbar.innerHTML = "<div style='width:280px;margin:auto;background:grey;color:white;padding:5px 5px 5px 5px;'>Forced Offline</div><br/>";
+    } else if (opsmode == "FORCED ON") {
+      elempumpstatus.innerHTML = "Forced ON (" + powerpktimer + " min)";
+      elempumpstatusbar.innerHTML = "<div style='width:280px;margin:auto;background:green;color:white;padding:5px 5px 5px 5px;'>Pumping (forced)</div><br/>";
+    } else {
+      elempumpstatus.innerHTML = "UNKNOWN MODE!!!";
+      elempumpstatusbar.innerHTML = "<div style='width:280px;margin:auto;background:green;color:white;padding:5px 5px 5px 5px;'>Forced Pumping</div><br/>";
+    }
   }
+
   function onLoad(event) {
     initWebSocket();
     initButton();
@@ -451,7 +476,7 @@ String htmlProcessor(const String& var){
   
   if (var == "OPERATINGMODEPLACEHOLDER"){
     String html = "";
-    html += "Operating Mode: " + master_operations_mode + "<br/>";
+    html += "Operating Mode: <span id='opsmode'>" + master_operations_mode + "</span><br/>";
     html += "<a href='/mastermode?mode=on'>Force ON</a> ";
     html += "<a href='/mastermode?mode=off'>Force OFF</a> ";
     html += "<a href='/mastermode?mode=auto'>AUTO</a><br/>";
@@ -471,9 +496,9 @@ String htmlProcessor(const String& var){
   }
   
   if (var == "PUMPSTATUSPLACEHOLDER"){
-    String html = "";
+    String html = "<span id='pumpstatusbar'>";
     if  (publicKlong_PumpDecision == 1) {
-    html += "<div style='width:280px;margin:auto;background:green;color:white;padding:5px 5px 5px 5px;'>Pumping</div><br/>";
+      html += "<div style='width:280px;margin:auto;background:green;color:white;padding:5px 5px 5px 5px;'>Pumping</div><br/>";
     } else {
       if ( master_operations_mode == master_mode_forced_off) {
         html += "<div style='width:280px;margin:auto;background:grey;color:white;padding:5px 5px 5px 5px;'>SYSTEM OFFLINE</div><br/>";
@@ -481,6 +506,7 @@ String htmlProcessor(const String& var){
         html += "<div style='width:280px;margin:auto;background:red;color:white;padding:5px 5px 5px 5px;'>Not pumping</div><br/>";
       }
     }
+    html += "</span>";
     return html;
   }
 
@@ -522,8 +548,8 @@ String htmlProcessor(const String& var){
 
     html += "  <tr>";
     html += "  <td>Pump:</td>";
+    html += "  <td id='pumpstatus'>";
     if (publicKlong_PumpDecision == 1) {
-      html += "  <td>";
       if (master_operations_mode == master_mode_forced_on) {
         html += "Forced ON";
       } else {
@@ -534,7 +560,6 @@ String htmlProcessor(const String& var){
       html += " min)";
       html += "</td>";
     } else {
-      html += "<td>";
       if (master_operations_mode == master_mode_forced_off) {
         html += "Forced OFF";
       } else {
@@ -546,7 +571,7 @@ String htmlProcessor(const String& var){
 
     html += "  <tr>";
     html += "    <td>Status:</td>";
-    html += "    <td>" + systemAnalysis + "</td>";
+    html += "    <td id='sysanalysis'>" + systemAnalysis + "</td>";
     html += "  </tr>";
 
     html += "</table>";
@@ -569,12 +594,16 @@ String htmlProcessor(const String& var){
 // WEBSOCKET functions
 // -------------------
 void notifyClients() {
-  Serial.println("WebSocket: Notify Clients");
+  // Serial.println("WebSocket: Notify Clients");
   String json = "";
   json += "{";
   json += "\"sensor\":" + String(publicKlong_SensorWaterDistance);
   json += ",\"frequency\":\"" + String(getPreferredSensorRefreshFrequencyAsString()) + "\"";
   json += ",\"minlvl\":\"" + String(publicKlong_PumpMinimumWaterLevel) + "\"";
+  json += ",\"opsmode\":\"" + master_operations_mode + "\"";
+  json += ",\"powerpk\":\"" + String(publicKlong_powered) + "\"";
+  json += ",\"powerpktimer\":\"" + String(publicKlong_operating_time_min) + "\"";
+  json += ",\"sysanalysis\":\"" + systemAnalysis + "\"";
   json += "}";
   ws.textAll(json);
 }
@@ -623,6 +652,24 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("Initialize...");
+
+  // IMMEDIATELY configure the PINs that control relays so they
+  // are not turned ON too long while booting... (will flicker)
+  // Configure Pump Relay and LED PINs
+  pinMode(PUBLIC_KLONG_RELAY_PIN, OUTPUT);
+  pinMode(PUBLIC_KLONG_RELAY_LED_PIN, OUTPUT);
+  digitalWrite(PUBLIC_KLONG_RELAY_PIN, HIGH);
+  digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
+
+  pinMode(SOUTH_KLONG_RELAY_PIN, OUTPUT);
+  pinMode(SOUTH_KLONG_RELAY_LED_PIN, OUTPUT);
+  digitalWrite(SOUTH_KLONG_RELAY_PIN, HIGH);
+  digitalWrite(SOUTH_KLONG_RELAY_LED_PIN, !digitalRead(SOUTH_KLONG_RELAY_PIN));
+
+  // Onboard LED off by default
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
 
   // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -765,21 +812,7 @@ void setup() {
   server.begin();
   Serial.println("HTTP server started");
 
-  // Configure Pump Relay and LED PINs
-  pinMode(PUBLIC_KLONG_RELAY_PIN, OUTPUT);
-  pinMode(PUBLIC_KLONG_RELAY_LED_PIN, OUTPUT);
-  digitalWrite(PUBLIC_KLONG_RELAY_PIN, HIGH);
-  digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
-
-  pinMode(SOUTH_KLONG_RELAY_PIN, OUTPUT);
-  pinMode(SOUTH_KLONG_RELAY_LED_PIN, OUTPUT);
-  digitalWrite(SOUTH_KLONG_RELAY_PIN, HIGH);
-  digitalWrite(SOUTH_KLONG_RELAY_LED_PIN, !digitalRead(SOUTH_KLONG_RELAY_PIN));
-
-  // Onboard LED off by default
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-
+ 
   // CONFIGURE ALL SMART BUTTONS
   pinMode(BUTTON_MENU_PIN, INPUT_PULLUP);
   pinMode(BUTTON_DEC_OPTIONS_PIN, INPUT_PULLUP);
@@ -1045,6 +1078,7 @@ void switchToNextDisplayMode(void) {
 
 // Output all information to serial console (RX/TX)
 void printAllDeviceDataToSerial() {
+  return;
   if (DISPLAY_MODE != DISPLAY_MODE_OPERATIONS) return;
   Serial.print("#");
   Serial.print(DEVICE_NAME);
