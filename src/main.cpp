@@ -6,6 +6,7 @@
 #include <Adafruit_SSD1306.h>
 #include <RCSwitch.h>
 #include <AceButton.h>
+#include <esp_now.h>
 
 // Includes needed for OTA Updates (Over-The-Air updates)
 #include <WiFi.h>
@@ -13,7 +14,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-String  VERSION = "v2.34";
+String  VERSION = "v2.45";
 String  DEVICE_NAME = "BKO-DMZ-DEV1";
 
 /// PIN Usage for this project
@@ -40,6 +41,14 @@ String  DEVICE_NAME = "BKO-DMZ-DEV1";
 //  | -- | IMPUT      | Needed for South Clong Meter Sensor (Echo)     |
 //  |    |            |                                                |
 //  +----+------------+------------------------------------------------+
+
+// Board Connectors
+// Distance Sensor:
+//    [o][o][o][o]  GND-TRIG(19)-ECHO(34)-VCC5
+// Pump Relay
+//    [o][o][o]     
+
+
 
 // REMOTE OPERATIONS
 //
@@ -73,7 +82,7 @@ String  DEVICE_NAME = "BKO-DMZ-DEV1";
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // WIFI settings
-// #define DEV_WIFI_MODE_AP   // DEV_WIFI_MODE_AP or DEV_WIFI_MODE_STATION
+#define DEV_WIFI_MODE_AP   // DEV_WIFI_MODE_AP or DEV_WIFI_MODE_STATION
 #ifdef DEV_WIFI_MODE_AP
   const char* ssid = "BKO-GARDEN-DMZ-DEV1";
   const char* password = "BKOGARDEN123*";
@@ -114,6 +123,7 @@ int   waterSensorsReadFrequencyOptions[] = { 1, 5, 10, 15, 30, 60, 2 * 60, 5 * 6
 int   waterSensorsReadFrequencySelected = 5;  // The INDEX of the option selected (default index 5: 1 minute)
 int   waterSensorsReadFrequencySelection = waterSensorsReadFrequencySelected;  // The INDEX of the option selected
 unsigned long waterSensorsLastReadTickerMS = 0;
+unsigned long waterSensorsPublicKlongLastDataReceivedMS = 0;
 bool  needRevaluationOfSituation = false;
 
 #define master_mode_automated "AUTO"
@@ -124,8 +134,6 @@ String master_operations_mode = master_mode_automated;
 
 #define MASTER_MODE_PUBLIC_PUMP_MANUAL_OFF
 #define MASTER_MODE_PUBLIC_PUMP_MANUAL_ON
-
-
 
 // MEASURE SENSORS settings (Ultrasonic SR04 Distance Sensor)
 #define SOUND_SPEED 0.034
@@ -203,6 +211,45 @@ void btnHandleEvent(AceButton*, uint8_t, uint8_t);
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
+
+// ESP-NOW Klong Sensor Data Structure
+typedef struct klong_sensor_data_message {
+  char deviceId[16];
+  char version[5];
+  unsigned long millis;
+  float waterDistance;
+} klong_sensor_data_message;
+klong_sensor_data_message klongData;
+unsigned long publicKlong_last_received_message_ms = 0;
+unsigned long publicKlong_time_since_last_message_ms = 0;
+
+// Callback function that will be executed when data is received from Sensors via ESP-NOW
+void onKlongDataReciever(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  // Serial.print(len);
+  // Serial.print(" Bytes received from ");
+  //  for (int i = 0; i < 6; i++) {
+  //    Serial.print("0x");
+  //    Serial.print(mac[i], HEX);
+  //    Serial.print(":");
+  //  }
+  // Serial.println();
+  memcpy(&klongData, incomingData, sizeof(klongData));
+  publicKlong_time_since_last_message_ms = klongData.millis - publicKlong_last_received_message_ms;
+  publicKlong_last_received_message_ms = klongData.millis;
+  publicKlong_SensorWaterDistance = klongData.waterDistance;
+  Serial.print("From ");
+  Serial.print(klongData.deviceId);
+  Serial.print(" (");
+  Serial.print(klongData.version);
+  Serial.print("): ");
+  Serial.print(klongData.waterDistance);
+  Serial.print("cm, Timer: ");
+  Serial.print(klongData.millis);
+  Serial.print(" Elapse: ");
+  Serial.print(publicKlong_time_since_last_message_ms / 1000);
+  Serial.println(" sec");
+  waterSensorsPublicKlongLastDataReceivedMS = millis();
+}
 
 int getPreferredSensorRefreshFrequencyInSeconds() {
   return waterSensorsReadFrequencyOptions[waterSensorsReadFrequencySelected];
@@ -423,11 +470,13 @@ const char index_html[] PROGMEM = R"rawliteral(
     var sysanalysis = msg.sysanalysis;
     var powerpk = msg.powerpk;
     var powerpktimer = msg.powerpktimer;
+    var timetoanalysis = msg.timetoanalysis;
     document.getElementById('sensor').innerHTML = sensorLevel + " cm";
     document.getElementById('frequency').innerHTML = frequency;
     document.getElementById('minlvl').innerHTML = minlvl + " cm";
     document.getElementById('opsmode').innerHTML = opsmode;
     document.getElementById('sysanalysis').innerHTML = sysanalysis;
+    document.getElementById('timetoanalysis').innerHTML = timetoanalysis;
     elempumpstatus = document.getElementById('pumpstatus');
     elempumpstatusbar = document.getElementById('pumpstatusbar');
     if (opsmode == "AUTO" && powerpk == 1) {
@@ -574,7 +623,8 @@ String htmlProcessor(const String& var){
     html += "    <td id='sysanalysis'>" + systemAnalysis + "</td>";
     html += "  </tr>";
 
-    html += "</table>";
+    html += "</table><br/>";
+    html += "Next Evaluation: <span id='timetoanalysis'></span>";
     // Serial.println(html);
     return html;
   }
@@ -604,6 +654,7 @@ void notifyClients() {
   json += ",\"powerpk\":\"" + String(publicKlong_powered) + "\"";
   json += ",\"powerpktimer\":\"" + String(publicKlong_operating_time_min) + "\"";
   json += ",\"sysanalysis\":\"" + systemAnalysis + "\"";
+  json += ",\"timetoanalysis\":\"" + String(getPreferredSensorRefreshFrequencyInSeconds() - (millis() - waterSensorsLastReadTickerMS) / 1000) + "s\"";
   json += "}";
   ws.textAll(json);
 }
@@ -685,6 +736,12 @@ void setup() {
     IP = WiFi.softAPIP();
     Serial.print("AP IP address: ");
     Serial.println(IP);
+    Serial.print("Channel: ");
+    Serial.println(WiFi.channel());
+    Serial.print("MAC address: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Soft AP MAC address: ");
+    Serial.println(WiFi.softAPmacAddress());
   #else
     // Initialize WIFI as a STATION (Client) and wait for connection
     Serial.println("WIFI operating as STATION mode.");
@@ -699,8 +756,14 @@ void setup() {
     Serial.println("");
     Serial.print("Connected to ");
     Serial.println(ssid);
+    Serial.print("Channel: ");
+    Serial.println(WiFi.channel());
     Serial.print("IP address: ");
     Serial.println(IP);
+    Serial.print("MAC address: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Soft AP MAC address: ");
+    Serial.println(WiFi.softAPmacAddress());
   #endif
 
   // Initialize WebSocket support
@@ -839,6 +902,14 @@ void setup() {
   publicKlong_PumpMinimumWaterLevel = preferences.getInt(prefRequiredDistancePublicKlong, prefRequiredDistancePublicKlong_default);
   master_operations_mode = preferences.getString(prefMasterOperationsMode, master_operations_mode);
 
+  // Init ESP-NOW
+  if (esp_now_init() != 0) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  // esp_now_set_self_role((ESP_NOW_ROLE_SLAVE);
+  esp_now_register_recv_cb(onKlongDataReciever);
+
   delay(2000); // Wait a bit more here as we show the splash screen
   Serial.println("Initialized!");
 }
@@ -903,9 +974,17 @@ void displayDeviceStatus(void) {
   display.print("#");
   display.print(DEVICE_NAME);
 
+  display.setCursor(0, SSD_L2);
+  display.print("MAC:");
+  display.print(WiFi.softAPmacAddress());
+
   // Display Line 4: Water Levels (Headers)
   display.setCursor(0, SSD_L3);
-  display.print("Sensor");
+  display.print("PK:");
+  char buff[5];
+  sprintf_P(buff, PSTR("%.02f"), (millis() - waterSensorsPublicKlongLastDataReceivedMS) / 1000.0); //results like 23.500001
+  display.print(String(buff));
+  display.print("s");
   display.setCursor(67, SSD_L3);
   display.print("Required");
 
@@ -1185,17 +1264,19 @@ void debugRF433MhzOutput(unsigned long decimal, unsigned int length, unsigned in
 
 
 void getWaterSensorsData() {
-  // PUBLIC KLONG
-  // ------------
-  // Trigger the sensor
-  digitalWrite(sensorPublicKlong_trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(sensorPublicKlong_trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(sensorPublicKlong_trigPin, LOW);
-  // Reads the echoPin, returns the sound wave travel time in microseconds
-  duration = pulseIn(sensorPublicKlong_echoPin, HIGH);
-  publicKlong_SensorWaterDistance = duration * SOUND_SPEED/2;
+
+  // CODE BELOW IS OBSOLETE SINCE WE RECEIVE THIS INFO VIA ESP-NOW CONTROLLER
+  // // PUBLIC KLONG
+  // // ------------
+  // // Trigger the sensor
+  // digitalWrite(sensorPublicKlong_trigPin, LOW);
+  // delayMicroseconds(2);
+  // digitalWrite(sensorPublicKlong_trigPin, HIGH);
+  // delayMicroseconds(10);
+  // digitalWrite(sensorPublicKlong_trigPin, LOW);
+  // // Reads the echoPin, returns the sound wave travel time in microseconds
+  // duration = pulseIn(sensorPublicKlong_echoPin, HIGH);
+  // publicKlong_SensorWaterDistance = duration * SOUND_SPEED/2;
 
   // // SOUTH KLONG
   // // ------------
