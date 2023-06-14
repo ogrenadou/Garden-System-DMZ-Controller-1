@@ -14,7 +14,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-String  VERSION = "v2.45";
+String  VERSION = "v2.47";
 String  DEVICE_NAME = "BKO-DMZ-DEV1";
 
 /// PIN Usage for this project
@@ -369,6 +369,7 @@ void analyzeWaterLevels() {
     // If so, stay as it currently is (pumping or not pumping)
     // The Max Time Pumping should protect from a forever-invalid reading
     systemAnalysis = "Invalid measure!";
+    publicKlong_PumpDecision = 0;
   } else if (publicKlong_PumpMinimumWaterLevel > publicKlong_SensorWaterDistance) {
     publicKlong_PumpDecision = 1;
     systemAnalysis = "OK to pump!";
@@ -1264,6 +1265,13 @@ void debugRF433MhzOutput(unsigned long decimal, unsigned int length, unsigned in
 
 
 void getWaterSensorsData() {
+
+  // If the last esp-now message with sensor data is too old,
+  // return zero to make it invalid by default
+
+  if ((millis() - waterSensorsPublicKlongLastDataReceivedMS) / 1000 > 10) {
+    publicKlong_SensorWaterDistance = 0.0;
+  }
 
   // CODE BELOW IS OBSOLETE SINCE WE RECEIVE THIS INFO VIA ESP-NOW CONTROLLER
   // // PUBLIC KLONG
