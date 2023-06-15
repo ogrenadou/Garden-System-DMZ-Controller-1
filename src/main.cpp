@@ -14,8 +14,8 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-String  VERSION = "v2.47";
-String  DEVICE_NAME = "BKO-DMZ-DEV1";
+String  VERSION = "v2.61";
+String  DEVICE_NAME = "BKO-DMZ-CTL1";
 
 /// PIN Usage for this project
 //
@@ -77,7 +77,7 @@ String  DEVICE_NAME = "BKO-DMZ-DEV1";
 #define SSD_L4 27
 #define SSD_L5 36
 #define SSD_L6 45
-#define SSD_L7 54
+#define SSD_L7 57
 #define PIXELS_PER_CHAR 7
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
@@ -125,6 +125,10 @@ int   waterSensorsReadFrequencySelection = waterSensorsReadFrequencySelected;  /
 unsigned long waterSensorsLastReadTickerMS = 0;
 unsigned long waterSensorsPublicKlongLastDataReceivedMS = 0;
 bool  needRevaluationOfSituation = false;
+int publicKlong_overheat_protection_max_runtime_minutes = 4 * 60;  // Pump should not run for more than that, otherwise might overheat
+int publicKlong_overheat_protection_time_off_minutes = 20;         // How long should the pump be stay off for overheat protection
+bool publicKlong_overheat_protection_activated = false;            // Tracks if overheat protection is activated
+unsigned long publicKlong_overheat_protection_kickoff_ms = 0;      // Track time since the pump was forced off for overheat protection
 
 #define master_mode_automated "AUTO"
 #define master_mode_forced_off "FORCED OFF"
@@ -356,27 +360,68 @@ void analyzeWaterLevels() {
 
   updatePumpTimers();
 
+  Serial.print("DEBUG ANALYSIS STARTED: ");
+
   // Check water levels to make decisions:
   // - If South Klong is full, no need to pump
   // - If South Klong needs wather, check if there is enough water in Public Klong to operate the pump
   // Override any decision if operations mode has been set to ON or OFF
   if (master_operations_mode ==  master_mode_forced_on) {
+    // If Mode is FORCED ON then just turn the pump ON
     publicKlong_PumpDecision = 1;
+    Serial.print("A");
   } else if (master_operations_mode ==  master_mode_forced_off) {
+    // If Mode is FORCED OFF then just turn the pump OFF
     publicKlong_PumpDecision = 0;
+    Serial.print("B");
   } else if ( publicKlong_SensorWaterDistance > 300 || publicKlong_SensorWaterDistance < 5) {
     // Cannot make decisions if the sensors returns unrealistic numbers
-    // If so, stay as it currently is (pumping or not pumping)
-    // The Max Time Pumping should protect from a forever-invalid reading
+    // For protection, turn the pump OFF because we just don't know if there is water 
     systemAnalysis = "Invalid measure!";
     publicKlong_PumpDecision = 0;
+    Serial.print("C");
   } else if (publicKlong_PumpMinimumWaterLevel > publicKlong_SensorWaterDistance) {
-    publicKlong_PumpDecision = 1;
-    systemAnalysis = "OK to pump!";
+    // We have enough water to activate the PUMP, but there are more conditions...
+    Serial.print("D");
+    if ( publicKlong_operating_time_min > publicKlong_overheat_protection_max_runtime_minutes & !publicKlong_overheat_protection_activated) {
+      // The Pump has been running for more than acceptable time
+      // so we enable the overheat protection
+      publicKlong_operating_time_min = 0;
+      publicKlong_overheat_protection_kickoff_ms = millis();
+      publicKlong_overheat_protection_activated = true;
+      publicKlong_PumpDecision = 0;
+      systemAnalysis = "Overheat protection activated";
+      Serial.print("E");
+    } else {
+      // We have enough water, just need to check if we are in overheat protection or not
+      Serial.print("F");
+      if (publicKlong_overheat_protection_activated) {
+        Serial.print("G");
+        // As we are under overheat protection, check if it has been off long enough
+        if (((millis() - publicKlong_overheat_protection_kickoff_ms) / 1000 / 60) >= publicKlong_overheat_protection_time_off_minutes) {
+          // It's been OFF long enough for overheat protection, we can restart the pump
+          publicKlong_overheat_protection_activated = false;
+          publicKlong_PumpDecision = 1;
+          systemAnalysis = "Overheat protection ended";
+          Serial.print("H");
+        } else {
+          publicKlong_PumpDecision = 0;
+          systemAnalysis = "Overheat protection activated";
+          Serial.print("I");
+        }
+      } else {
+        publicKlong_PumpDecision = 1;
+        systemAnalysis = "OK to pump!";
+        Serial.print("J");
+      }
+    }
   } else {
     publicKlong_PumpDecision = 0;
     systemAnalysis = "Water TOO LOW to pump";
+    Serial.print("K");
   }
+
+  Serial.println();
 
   if (publicKlong_PumpDecision) {
     startPump1();
@@ -416,15 +461,9 @@ const char index_html[] PROGMEM = R"rawliteral(
   <link rel="icon" href="data:,">
   <style>
     html {font-family: Arial; display: inline-block; text-align: center;}
-    h2 {font-size: 3.0rem;}
+    h2 {font-size: 2.0rem;}
     p {font-size: 3.0rem;}
     body {max-width: 600px; margin:0px auto; padding-bottom: 25px;}
-    .switch {position: relative; display: inline-block; width: 120px; height: 68px} 
-    .switch input {display: none}
-    .slider {position: absolute; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; border-radius: 6px}
-    .slider:before {position: absolute; content: ""; height: 52px; width: 52px; left: 8px; bottom: 8px; background-color: #fff; -webkit-transition: .4s; transition: .4s; border-radius: 3px}
-    input:checked+.slider {background-color: #b30000}
-    input:checked+.slider:before {-webkit-transform: translateX(52px); -ms-transform: translateX(52px); transform: translateX(52px)}
     table {border-collapse: collapse;margin-left:auto;margin-right:auto;}
     td, th {border: 1px solid #dddddd; text-align: left; padding: 8px;}
     tr:nth-child(even) { background-color: #dddddd; }
@@ -432,15 +471,15 @@ const char index_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <h2>BKO Garden System</h2>
-  %VERSIONPLACEHOLDER%
-  <br/>
   %OPERATINGMODEPLACEHOLDER%
-  <br/>
-  %WATERLIMITPLACEHOLDER%
   <br/>
   %PUMPSTATUSPLACEHOLDER%
   <br/>
   %SYSTEMSTATUSPLACEHOLDER%
+  <br/>
+  %WATERLIMITPLACEHOLDER%
+  <br/>
+  %VERSIONPLACEHOLDER%
   <br/>
   %FIRMWAREPLACEHOLDER%
 <script>
@@ -465,6 +504,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     console.log('WS On Message:' + event.data);
     msg = JSON.parse(event.data)
     var sensorLevel = msg.sensor;
+    var lastpkespnowmsg = msg.lastpkespnowmsg;
     var frequency = msg.frequency;
     var minlvl = msg.minlvl;
     var opsmode = msg.opsmode;
@@ -472,7 +512,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     var powerpk = msg.powerpk;
     var powerpktimer = msg.powerpktimer;
     var timetoanalysis = msg.timetoanalysis;
-    document.getElementById('sensor').innerHTML = sensorLevel + " cm";
+    var overheattimeleft = msg.overheattimeleft;
+    var overheatprotectiontime = msg.overheatprotectiontime;
+    var overheatprotectionactivated = msg.overheatprotectionactivated;
+    var overheatprotectionmaxruntime = msg.overheatprotectionmaxruntime;
+    document.getElementById('sensor').innerHTML = sensorLevel + "&nbsp;cm (" + lastpkespnowmsg + " sec&nbsp;ago)";
     document.getElementById('frequency').innerHTML = frequency;
     document.getElementById('minlvl').innerHTML = minlvl + " cm";
     document.getElementById('opsmode').innerHTML = opsmode;
@@ -495,6 +539,14 @@ const char index_html[] PROGMEM = R"rawliteral(
     } else {
       elempumpstatus.innerHTML = "UNKNOWN MODE!!!";
       elempumpstatusbar.innerHTML = "<div style='width:280px;margin:auto;background:green;color:white;padding:5px 5px 5px 5px;'>Forced Pumping</div><br/>";
+    }
+    var overheatprotectioninfo = "<span style='text-decoration: underline;'>Configuration:</span><br/>";
+    overheatprotectioninfo += "\u2022 " + overheatprotectionmaxruntime + " minutes on,<br/>";
+    overheatprotectioninfo += "\u2022 " + overheatprotectiontime + " minutes off.<br/>";
+    if (overheatprotectionactivated == 1) {
+      document.getElementById('overheatmaxtime').innerHTML = "" + overheatprotectioninfo + "<span style='color:red'>Active Overheat Protection<br/> time left: " + overheattimeleft + " sec.</span>";
+    } else {
+      document.getElementById('overheatmaxtime').innerHTML = "" + overheatprotectioninfo;
     }
   }
 
@@ -520,7 +572,7 @@ String htmlProcessor(const String& var){
 
   if (var == "VERSIONPLACEHOLDER"){
     String version = "";
-    version += DEVICE_NAME + "<br/>" + VERSION + "<br/>";
+    version += DEVICE_NAME + " (" + VERSION + ")<br/>";
     return version;
   }
   
@@ -536,7 +588,6 @@ String htmlProcessor(const String& var){
   
   if (var == "WATERLIMITPLACEHOLDER"){
     String html = "";
-  
     html += "<form action='/setmin'>";
     html += "<label for='lvl'>Min Level:</label> ";
     html += "<input type='text' style='width:30px' id='flvl' name='lvl' value='" + String(publicKlong_PumpMinimumWaterLevel) + "'> cm ";
@@ -624,15 +675,19 @@ String htmlProcessor(const String& var){
     html += "    <td id='sysanalysis'>" + systemAnalysis + "</td>";
     html += "  </tr>";
 
+    html += "  <tr>";
+    html += "    <td>Overheat<br/>Protection:</td>";
+    html += "    <td id='overheatmaxtime'></td>";
+    html += "  </tr>";
+
     html += "</table><br/>";
-    html += "Next Evaluation: <span id='timetoanalysis'></span>";
-    // Serial.println(html);
+
+    html += "Next Evaluation: <span id='timetoanalysis'></span><br/>";
     return html;
   }
   
   if (var == "FIRMWAREPLACEHOLDER") {
     String html = "";
-    html += "<br/>";
     html += "Firmware: " + String(__DATE__) + " " + String(__TIME__) + "<br/>";
     html += "<a href='/update'>Update Firmware</a><br/>";
     html += "<a href='/reboot'>Reboot</a>";
@@ -656,6 +711,15 @@ void notifyClients() {
   json += ",\"powerpktimer\":\"" + String(publicKlong_operating_time_min) + "\"";
   json += ",\"sysanalysis\":\"" + systemAnalysis + "\"";
   json += ",\"timetoanalysis\":\"" + String(getPreferredSensorRefreshFrequencyInSeconds() - (millis() - waterSensorsLastReadTickerMS) / 1000) + "s\"";
+  json += ",\"lastpkespnowmsg\":\"" + String((millis() - waterSensorsPublicKlongLastDataReceivedMS) / 1000.0) + "\"";
+  if (publicKlong_overheat_protection_activated) {
+    json += ",\"overheattimeleft\":\"" + String((publicKlong_overheat_protection_time_off_minutes * 60) - ((millis() - publicKlong_overheat_protection_kickoff_ms) / 1000)) + "\"";
+  } else {
+    json += ",\"overheattimeleft\":\"0\"";
+  }
+  json += ",\"overheatprotectionactivated\":\"" + String(publicKlong_overheat_protection_activated) + "\"";
+  json += ",\"overheatprotectiontime\":\"" + String(publicKlong_overheat_protection_time_off_minutes) + "\"";
+  json += ",\"overheatprotectionmaxruntime\":\"" + String(publicKlong_overheat_protection_max_runtime_minutes) + "\"";
   json += "}";
   ws.textAll(json);
 }
@@ -922,8 +986,8 @@ void sendRF433MhzCode(int on) {
   myRadioSignalSwitch.setProtocol(1);
   myRadioSignalSwitch.setRepeatTransmit(5);
 
-  Serial.print("Sending RF 433Mhz Code: ");
-  Serial.println(on);
+  // Serial.print("Sending RF 433Mhz Code: ");
+  // Serial.println(on);
   
   if (on) 
   { // RM2-D-ON: Decimal: 4199697 (24Bit) Binary: 010000000001010100010001  
