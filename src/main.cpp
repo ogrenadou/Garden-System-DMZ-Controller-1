@@ -65,6 +65,20 @@ String  DEVICE_NAME = "BKO-DMZ-CTL1";
 //   +----------------- MENU / SCREEN SELECTION 
 
 
+// DATA PACKETS Structure: ID.T.XXXXXX
+//     ID : Device ID
+//      T : Data Type
+// XXXXXX : Value of the data
+// DEVICE INFORMATION used for 433Mhz data packets
+#define DATA_PACKET_DEVICE_ID_CTL1    10  // This device DMZ_CTL1
+#define DATA_PACKET_DEVICE_ID_PK      11  // Public Klong water distance
+// DATA TYPES used for 433Mhz data packets
+#define DATA_PACKET_DATATYPE_PWR      1   // Power Status
+#define DATA_PACKET_DATATYPE_WLVL     2   // Water Level
+// DATA VALUES used for 433Mhz data packets
+// These are variables but some are basic such as 1: power is ON, 0: power is off
+
+
 // LCD Screen Display settings
 // ---------------------------
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
@@ -111,10 +125,10 @@ float southKlong_SensorWaterDistance = 0;     // In centimeters, the distance be
 float southKlong_CurrentWaterLevel = 0.0;     // In centimeters, the current relative water level from the virtual zero level. 
                                               // n > 0 = water is above target, n < 0 = water is below target
 int   publicKlongSensor_VirtualZero = 25;     // Water distance from the sensor to the water when public klong is the same as south klong target full capacity
-float publicKlong_SensorWaterDistance = 0;    // In centimeters, the distance between the sensor and the water
+float publicKlong_SensorWaterDistance = 0.0;  // In centimeters, the distance between the sensor and the water
 float publicKlong_CurrentWaterLevel = 0.0;    // In centimeters, the current relative water level from the virtual zero level. 
                                               // n > 0 = water is above target, n < 0 = water is below target
-int   publicKlong_PumpMinimumWaterLevel = 30;  // Distance from Sensor to water level needed to start the pump safely
+int   publicKlong_PumpMinimumWaterLevel = 30; // Distance from Sensor to water level needed to start the pump safely
 int   publicKlong_PumpDecision = 0;
 String systemAnalysis = "";
 // Provide options for how often we check water and make decisions
@@ -190,7 +204,8 @@ void displayDeviceStatus(void);
 void updateWifiStatus(void);
 void updateDisplay(void);
 void displaySplashScreen(void);
-void sendRF433MhzCode(int);
+void sendRF433MhzPowerInfo(int);
+void sendRF433MhzCode(int, int, int);
 
 // Dynamic Preferences for all appropriate settings
 #define prefNameWaterSensorReadFrequency "waterSensReadFq"
@@ -290,7 +305,7 @@ char * getPreferredSensorRefreshFrequencyAsString(int selectedIndex) {
 void startPump1() {
   int previousState = publicKlong_powered;
   publicKlong_powered = 1;
-  sendRF433MhzCode(publicKlong_powered);
+  sendRF433MhzPowerInfo(publicKlong_powered);
   digitalWrite(PUBLIC_KLONG_RELAY_PIN, LOW);
   digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
   if (previousState == 1) return;  // Do nothing if it was already in required state
@@ -301,7 +316,7 @@ void startPump1() {
 void stopPump1() {
   int previousState = publicKlong_powered;
   publicKlong_powered = 0;
-  sendRF433MhzCode(publicKlong_powered);
+  sendRF433MhzPowerInfo(publicKlong_powered);
   digitalWrite(PUBLIC_KLONG_RELAY_PIN, HIGH);
   digitalWrite(PUBLIC_KLONG_RELAY_LED_PIN, !digitalRead(PUBLIC_KLONG_RELAY_PIN));
   if (previousState == 0) return;  // Do nothing if already required state
@@ -383,7 +398,7 @@ void analyzeWaterLevels() {
   } else if (publicKlong_PumpMinimumWaterLevel > publicKlong_SensorWaterDistance) {
     // We have enough water to activate the PUMP, but there are more conditions...
     Serial.print("D");
-    if ( publicKlong_operating_time_min > publicKlong_overheat_protection_max_runtime_minutes & !publicKlong_overheat_protection_activated) {
+    if ( (publicKlong_operating_time_min > publicKlong_overheat_protection_max_runtime_minutes) && !publicKlong_overheat_protection_activated) {
       // The Pump has been running for more than acceptable time
       // so we enable the overheat protection
       publicKlong_operating_time_min = 0;
@@ -421,21 +436,21 @@ void analyzeWaterLevels() {
     Serial.print("K");
   }
 
-  Serial.println();
+  Serial.println(); // End of Debug line
 
-  if (publicKlong_PumpDecision) {
+  if (publicKlong_PumpDecision == 1) {
     startPump1();
-    return;
   } else {
     stopPump1();
-    return;
   }
 
-  // Nothing has been decided at this point (BUG!!!)
-  // Let's turn the pump OFF to be safe
-  publicKlong_PumpDecision = 0;
-  systemAnalysis = "!!! Cannot decide !!!";
-  stopPump1();
+  // Send Water data over 433Mhz for statistics
+  if (publicKlong_SensorWaterDistance > 999) {
+    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_WLVL, 999 * 100);
+  } else {
+    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_WLVL, publicKlong_SensorWaterDistance * 100);
+  }
+
 }
 
 void handleMasterOperationsChoice(String opsmode) {
@@ -979,32 +994,48 @@ void setup() {
   Serial.println("Initialized!");
 }
 
-
-// Send RF Code over 433Mhz
-void sendRF433MhzCode(int on) {
+// Send RF Smart codes over 433Mhz
+// - Device ID from 10 to 99,  e.g. device id 27
+// - Data Type from 0 to 9     e.g. data type 1 (distance measure)
+// - Data value xxxx.xx        e.g. 124.78cm 
+// The value for this example will be:
+//   271012478
+// Data Types are:
+//  1: Distance Measure (klong water level for example)
+//  2: Pump status
+void sendRF433MhzCode(int deviceid, int datatype, int value) {
+  // Check if parameters are acceptable
+  if (    deviceid < 10 || deviceid > 99
+       || datatype < 0  || datatype > 9
+       || value < 0     || value > 999999 ) {
+    Serial.print("433Mhz: Out of range value! ");
+    Serial.print("DeviceID: ");
+    Serial.print(deviceid);
+    Serial.print("DataType: ");
+    Serial.print(datatype);
+    Serial.print("Value: ");
+    Serial.println(value);
+  }
+  // Build the binary string for the final code
+  uint32_t intValue = deviceid * 10000000 + datatype * 1000000 + value;
+  Serial.print("Sending 433Mhz code: ");
+  Serial.println(intValue);
   myRadioSignalSwitch.setPulseLength(325);
-  myRadioSignalSwitch.setProtocol(1);
-  myRadioSignalSwitch.setRepeatTransmit(5);
-
-  // Serial.print("Sending RF 433Mhz Code: ");
-  // Serial.println(on);
-  
-  if (on) 
-  { // RM2-D-ON: Decimal: 4199697 (24Bit) Binary: 010000000001010100010001  
-    myRadioSignalSwitch.send("010000000001010100010001"); 
-    virtualPlug2A = true;
-    digitalWrite(LED_BUILTIN, HIGH);
-  }     
-  else 
-  { // RM2-D-OFF: Decimal: 4199700 (24Bit) Binary: 010000000001010100010100  
-    myRadioSignalSwitch.send("010000000001010100010100"); 
-    virtualPlug2A = false;
-    digitalWrite(LED_BUILTIN, LOW);
-  }    
-
-  updateDisplay();
+  // myRadioSignalSwitch.setProtocol(1);
+  myRadioSignalSwitch.setRepeatTransmit(3);
+  myRadioSignalSwitch.send(intValue, 32); 
 }
 
+// Send RF Code over 433Mhz
+void sendRF433MhzPowerInfo(int on) {
+  if (on) { 
+    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_PWR, 1);
+  } else { 
+    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_PWR, 0);
+  }    
+}
+
+// Based on 433Mhz received code, get the name matching the command (code)
 String getCommandName(int v) {
   // Phenix RM 2  (DIP: 01111)
   if (v == 4195665) { return "PH2-A-ON"; }  else 
@@ -1374,8 +1405,8 @@ void loop() {
   if (myRadioSignalSwitch.available()) {
     lastRFvalue = myRadioSignalSwitch.getReceivedValue();
     debugRF433MhzOutput(myRadioSignalSwitch.getReceivedValue(), myRadioSignalSwitch.getReceivedBitlength(), myRadioSignalSwitch.getReceivedDelay(), myRadioSignalSwitch.getReceivedRawdata(), myRadioSignalSwitch.getReceivedProtocol());
-    // if (lastRFvalue == RM2_A_ON)  { delay(800); digitalWrite(LED_BUILTIN, HIGH); sendRF433MhzCode(true); }
-    // if (lastRFvalue == RM2_A_OFF) { delay(800); digitalWrite(LED_BUILTIN, LOW);  sendRF433MhzCode(false); }
+    // if (lastRFvalue == RM2_A_ON)  { delay(800); digitalWrite(LED_BUILTIN, HIGH); sendRF433MhzPowerInfo(true); }
+    // if (lastRFvalue == RM2_A_OFF) { delay(800); digitalWrite(LED_BUILTIN, LOW);  sendRF433MhzPowerInfo(false); }
     delay(1);
     myRadioSignalSwitch.resetAvailable();
   }
