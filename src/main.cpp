@@ -14,7 +14,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 
-String  VERSION = "v2.62";
+String  VERSION = "v2.63";
 String  DEVICE_NAME = "BKO-DMZ-CTL1";
 
 /// PIN Usage for this project
@@ -1024,15 +1024,19 @@ void sendRF433MhzCode(int deviceid, int datatype, int value) {
   // myRadioSignalSwitch.setProtocol(1);
   myRadioSignalSwitch.setRepeatTransmit(3);
   myRadioSignalSwitch.send(intValue, 32); 
-  delay(50);
+  delay(200);
 }
 
 // Send RF Code over 433Mhz
 void sendRF433MhzPowerInfo(int on) {
   if (on) { 
-    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_PWR, 1);
+    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_PWR, 2);
   } else { 
-    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_PWR, 0);
+    if (publicKlong_overheat_protection_activated) {
+      sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_PWR, 1);
+    } else {
+      sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_PWR, 0);
+    }
   }    
 }
 
