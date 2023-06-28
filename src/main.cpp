@@ -17,6 +17,9 @@
 String  VERSION = "v2.63";
 String  DEVICE_NAME = "BKO-DMZ-CTL1";
 
+#define DEBUG_LOG_ENABLED false
+#define DEBUG_LOG if(DEBUG_LOG_ENABLED)Serial
+
 /// PIN Usage for this project
 //
 //  +----+------------+------------------------------------------------+
@@ -125,7 +128,8 @@ float southKlong_SensorWaterDistance = 0;     // In centimeters, the distance be
 float southKlong_CurrentWaterLevel = 0.0;     // In centimeters, the current relative water level from the virtual zero level. 
                                               // n > 0 = water is above target, n < 0 = water is below target
 int   publicKlongSensor_VirtualZero = 25;     // Water distance from the sensor to the water when public klong is the same as south klong target full capacity
-float publicKlong_SensorWaterDistance = 0.0;  // In centimeters, the distance between the sensor and the water
+float publicKlong_RawDataWaterDistance = 0.0; // In centimeters, the distance between the sensor and the water exactly as received
+float publicKlong_SensorWaterDistance = 0.0;  // In centimeters, the distance between the sensor and the water after applying smart dataset noise reduction logic
 float publicKlong_CurrentWaterLevel = 0.0;    // In centimeters, the current relative water level from the virtual zero level. 
                                               // n > 0 = water is above target, n < 0 = water is below target
 int   publicKlong_PumpMinimumWaterLevel = 30; // Distance from Sensor to water level needed to start the pump safely
@@ -231,6 +235,155 @@ AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
 
+// MEASUREMENTS DATASET CLEANUP
+// Smooths data to eliminate noise
+const int maxMeasures = 30;
+const int maxHighestMeasures = 20;
+float measures[maxMeasures];
+int measureIndex = -1;
+int highestMeasureIndex = -1;
+int measureCollectionRound = 1;
+// Simply return the average of all measurements
+float getMeasurementsAvg() {
+  float total = 0.0;
+  for (int i=0; i < maxMeasures; i++) {
+    total += measures[i];
+  }
+  float avg = total / 30.0;
+  return avg;
+}
+// Look at one full dataset and collect the N lowest points
+// then calculate the averate and replace all other poinst (higher points)
+// with the average.
+float applyHighestMeasuresAsAverage() {
+  float workMeasures[maxMeasures];            // We are aletering data so need to work on a copy
+  float originalMeasures[maxMeasures];        // This array will contain the original datapoints for DEBUG ONLY!
+  float lastHighestLevel = 0.0;
+  int lastHighestIndex = -1;
+  int highestMeasuresCount = 0;
+  float highestMeasuresSum = 0.0;
+  float highestMeasuresAvg = 0.0;
+  // Step 1: Copy the raw data before we alter it
+  //         to both work array and debug log array
+  for (int i=0; i < maxMeasures; i++) {
+    workMeasures[i] = measures[i];
+    originalMeasures[i] = measures[i];
+  }
+  // Step 2: - Find the next highest value for as many 
+  //           times needed to find out the maxHighestMeasues needed
+  //         - Calculate the average of those highest measures on the fly
+  DEBUG_LOG.println("Finding the top N highest measures...");
+  for (int m=0; m < maxHighestMeasures; m++) { 
+    DEBUG_LOG.print("Measures Scan #");
+    DEBUG_LOG.println(m + 1);
+    lastHighestLevel = 0.0;
+    // Find the highest value and its index
+    for (int i=0; i < maxMeasures; i++) { 
+      DEBUG_LOG.print("   ");
+      DEBUG_LOG.print(i);
+      DEBUG_LOG.print(" --> ");
+      DEBUG_LOG.print(workMeasures[i]);
+      if (workMeasures[i] > lastHighestLevel) {
+        lastHighestLevel = workMeasures[i];
+        lastHighestIndex = i;
+        DEBUG_LOG.print(" ! (last highest :");
+        DEBUG_LOG.print(lastHighestLevel);
+        DEBUG_LOG.print(" @");
+        DEBUG_LOG.print(lastHighestIndex);
+      }
+      DEBUG_LOG.println();
+    }
+    DEBUG_LOG.print("Last Highest Measure: ");
+    DEBUG_LOG.print(lastHighestLevel);
+    DEBUG_LOG.print(" at index ");
+    DEBUG_LOG.println(lastHighestIndex);
+    // Track the max values average
+    // Reset to -1 the highest value identified
+    highestMeasuresSum += workMeasures[lastHighestIndex];
+    highestMeasuresCount += 1;
+    workMeasures[lastHighestIndex] = -1;
+  }
+  // Calculate average of selected highest values
+  highestMeasuresAvg = highestMeasuresSum / (highestMeasuresCount * 1.0);
+  // Now we have identified the N highest measures
+  // We can replace all out-of-scope measures with the average
+  for (int i=0; i < maxMeasures; i++) {
+    if (workMeasures[i] != -1) {
+      measures[i] = highestMeasuresAvg; 
+    }
+  }
+
+  // Debug Serial output of data processing
+  DEBUG_LOG.print("Highest Average: ");
+  DEBUG_LOG.println(highestMeasuresAvg);
+  DEBUG_LOG.println();
+  DEBUG_LOG.println("Original  Highest  Outcome");
+  for (int i=0; i < maxMeasures; i++) {
+    DEBUG_LOG.print(originalMeasures[i]);
+    DEBUG_LOG.print("   ");
+    DEBUG_LOG.print(workMeasures[i]);
+    DEBUG_LOG.print("   ");
+    DEBUG_LOG.print(measures[i]);
+    DEBUG_LOG.println("   ");
+  }
+  return highestMeasuresAvg;
+}
+// Process raw data by adding processing received measures
+float addMeasureToMeasurements(float lastMeasure) {
+  float applicableMeasure = 0.0;
+  DEBUG_LOG.print("Round: ");
+  DEBUG_LOG.print(measureCollectionRound);
+  DEBUG_LOG.print("  Last index: ");
+  DEBUG_LOG.println(measureIndex);
+
+  // Process the first data collection as raw data
+  if (measureCollectionRound == 1) {
+    if (measureIndex < maxMeasures -1) {       // We are still filling up the first dataset
+      measureIndex += 1;              
+      measures[measureIndex] = lastMeasure;    // Add latest measure to it
+      applicableMeasure = 666;
+    } else {    // We have a full first dataset
+      measureIndex = 0;  // Prepare index for the next round
+      measureCollectionRound += 1;
+      applicableMeasure = applyHighestMeasuresAsAverage();
+      measures[measureIndex] = applicableMeasure;    // Add latest measure to it
+    }
+  } else {
+    if (measureIndex < maxMeasures -1) {
+      measureIndex += 1;              
+    } else {    // We have a full first dataset
+      measureIndex = 0;  // Prepare index for the next round
+      measureCollectionRound += 1;
+    }
+    // At this point we have our baseline, we can decide
+    // what to do with new value if within x% of the average of highest measures:
+    // - Accept the last measurement, add to measurements and return it as latest value
+    // - Reject the last measurement, add the average into measurements instead and return the average value
+    float measurementsAvg = getMeasurementsAvg();
+    if (   (lastMeasure - measurementsAvg) / measurementsAvg < -0.03 
+        || (lastMeasure - measurementsAvg) / measurementsAvg > 0.03 ) {
+      applicableMeasure = measurementsAvg;
+      measures[measureIndex] = applicableMeasure;
+      DEBUG_LOG.print("New Measure: OUT OF BOUND. Measure: ");
+      DEBUG_LOG.print(lastMeasure);
+      DEBUG_LOG.print("  Applicable: ");
+      DEBUG_LOG.print(applicableMeasure);
+      DEBUG_LOG.print("  Average: ");
+      DEBUG_LOG.println(measurementsAvg);
+    } else {
+      // applicableMeasure = lastMeasure;
+      measures[measureIndex] = lastMeasure;
+      applicableMeasure = measurementsAvg;
+      DEBUG_LOG.print("New Measure: ACCEPTED. Measure: ");
+      DEBUG_LOG.print(lastMeasure);
+      DEBUG_LOG.print("  Average: ");
+      DEBUG_LOG.println(measurementsAvg);
+    }
+  }
+  return applicableMeasure;
+}
+
+
 // ESP-NOW Klong Sensor Data Structure
 typedef struct klong_sensor_data_message {
   char deviceId[16];
@@ -255,7 +408,8 @@ void onKlongDataReciever(const uint8_t * mac, const uint8_t *incomingData, int l
   memcpy(&klongData, incomingData, sizeof(klongData));
   publicKlong_time_since_last_message_ms = klongData.millis - publicKlong_last_received_message_ms;
   publicKlong_last_received_message_ms = klongData.millis;
-  publicKlong_SensorWaterDistance = klongData.waterDistance;
+  publicKlong_RawDataWaterDistance = klongData.waterDistance;
+  publicKlong_SensorWaterDistance = addMeasureToMeasurements(klongData.waterDistance);   // TODO: Plug data cleanup call here
   Serial.print("From ");
   Serial.print(klongData.deviceId);
   Serial.print(" (");
@@ -519,6 +673,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     console.log('WS On Message:' + event.data);
     msg = JSON.parse(event.data)
     var sensorLevel = msg.sensor;
+    var rawsensorlevel = msg.rawsensor;
     var lastpkespnowmsg = msg.lastpkespnowmsg;
     var frequency = msg.frequency;
     var minlvl = msg.minlvl;
@@ -531,7 +686,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     var overheatprotectiontime = msg.overheatprotectiontime;
     var overheatprotectionactivated = msg.overheatprotectionactivated;
     var overheatprotectionmaxruntime = msg.overheatprotectionmaxruntime;
-    document.getElementById('sensor').innerHTML = sensorLevel + "&nbsp;cm (" + lastpkespnowmsg + " sec&nbsp;ago)";
+    document.getElementById('sensor').innerHTML = sensorLevel + "&nbsp;cm (" + lastpkespnowmsg + " sec&nbsp;ago)<br/>Raw: " + rawsensorlevel + "cm";
     document.getElementById('frequency').innerHTML = frequency;
     document.getElementById('minlvl').innerHTML = minlvl + " cm";
     document.getElementById('opsmode').innerHTML = opsmode;
@@ -719,6 +874,7 @@ void notifyClients() {
   String json = "";
   json += "{";
   json += "\"sensor\":" + String(publicKlong_SensorWaterDistance);
+  json += ",\"rawsensor\":" + String(publicKlong_RawDataWaterDistance);
   json += ",\"frequency\":\"" + String(getPreferredSensorRefreshFrequencyAsString()) + "\"";
   json += ",\"minlvl\":\"" + String(publicKlong_PumpMinimumWaterLevel) + "\"";
   json += ",\"opsmode\":\"" + master_operations_mode + "\"";
@@ -773,6 +929,23 @@ void initWebSocket() {
   server.addHandler(&ws);
 }
 
+bool handleSetOpsMode(String opsMode) {
+  if (opsMode == "on") master_operations_mode = master_mode_forced_on;
+  else if (opsMode == "off") master_operations_mode = master_mode_forced_off;
+  else if (opsMode == "auto") master_operations_mode = master_mode_automated;
+  else {
+    master_operations_mode = master_mode_forced_off;
+    return false;
+  }
+  int results = preferences.putString(prefMasterOperationsMode, master_operations_mode);
+  if (results == 0) {
+    Serial.println("Preferences: An error occured while saving Master Operations Mode");
+  } else {
+    Serial.print("Preferences: Master Operations Mode saved: ");
+    Serial.print(opsMode);
+  }      
+  return true;
+}
 
 // ***********************
 // *****  S E T U P  *****
@@ -893,27 +1066,15 @@ void setup() {
     Serial.print("Web request /mastermode");
     needRevaluationOfSituation = true;  // Always re-evaluate everything after a web page request
     String opsMode;
-    String msg;
     if (request->hasParam("mode")) {
       opsMode = request->getParam("mode")->value();
       Serial.print("Web request /mastermode: ");
       Serial.println(opsMode);
-      if (opsMode == "on") master_operations_mode = master_mode_forced_on;
-      else if (opsMode == "off") master_operations_mode = master_mode_forced_off;
-      else if (opsMode == "auto") master_operations_mode = master_mode_automated;
-      else {
-        master_operations_mode = master_mode_automated;
-        msg = "INVALID REQUEST:  /mastermode?mode=xx Valid values are on / off / auto";
+      if (!handleSetOpsMode(opsMode)) {
+        String msg = "INVALID REQUEST:  /mastermode?mode=xx Valid values are on / off / auto";
         request->send(200, "text/plain", msg);
         return;
-      }
-      int results = preferences.putString(prefMasterOperationsMode, master_operations_mode);
-      if (results == 0) {
-        Serial.println("Preferences: An error occured while saving Master Operations Mode");
-      } else {
-        Serial.print("Preferences: Master Operations Mode saved: ");
-        Serial.print(opsMode);
-      }      
+      };
     }
     else {
       String msg = "Invalid request, ?mode=xx parameter is required!";
@@ -1274,6 +1435,8 @@ void printAllDeviceDataToSerial() {
   Serial.print(" Public Klong: ");
   Serial.print(" Sensor: ");
   Serial.print(publicKlong_SensorWaterDistance);
+  Serial.print(" Raw Sensor: ");
+  Serial.print(publicKlong_RawDataWaterDistance);
   Serial.print(" Level: ");
   Serial.print(publicKlong_CurrentWaterLevel);
   Serial.print(" Pump: ");
@@ -1371,6 +1534,7 @@ void getWaterSensorsData() {
 
   if ((millis() - waterSensorsPublicKlongLastDataReceivedMS) / 1000 > 10) {
     publicKlong_SensorWaterDistance = 0.0;
+    publicKlong_RawDataWaterDistance = 0.0;
   }
 
   // CODE BELOW IS OBSOLETE SINCE WE RECEIVE THIS INFO VIA ESP-NOW CONTROLLER
@@ -1490,6 +1654,11 @@ void btnDecOptionsEvent(AceButton* button, uint8_t eventType, uint8_t buttonStat
         Serial.print("->");
         Serial.println(waterSensorsReadFrequencySelection);
         updateDisplay();
+      } 
+      if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) {
+          if (!handleSetOpsMode("off")) {
+          Serial.println("Something went wrong. Valid values are on / off / auto");
+          }
       }
       break;
   }
@@ -1508,6 +1677,11 @@ void btnIncOptionsEvent(AceButton* button, uint8_t eventType, uint8_t buttonStat
           waterSensorsReadFrequencySelection = 0;
         }
         updateDisplay();
+      }
+      if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) {
+          if (!handleSetOpsMode("on")) {
+          Serial.println("Something went wrong. Valid values are on / off / auto");
+          }
       }
       break;
   }
@@ -1531,6 +1705,11 @@ void btnConfirmEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) 
       }
       if (DISPLAY_MODE == DISPLAY_MODE_REBOOT) {
         ESP.restart();
+      }
+      if (DISPLAY_MODE == DISPLAY_MODE_OPERATIONS) {
+          if (!handleSetOpsMode("auto")) {
+          Serial.println("Something went wrong. Valid values are on / off / auto");
+          }
       }
       updateDisplay();
       break;
