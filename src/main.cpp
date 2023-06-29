@@ -143,8 +143,8 @@ int   waterSensorsReadFrequencySelection = waterSensorsReadFrequencySelected;  /
 unsigned long waterSensorsLastReadTickerMS = 0;
 unsigned long waterSensorsPublicKlongLastDataReceivedMS = 0;
 bool  needRevaluationOfSituation = false;
-int publicKlong_overheat_protection_max_runtime_minutes = 4 * 60;  // Pump should not run for more than that, otherwise might overheat
-int publicKlong_overheat_protection_time_off_minutes = 20;         // How long should the pump be stay off for overheat protection
+int publicKlong_overheat_protection_max_runtime_minutes = 6 * 60;  // Pump should not run for more than that, otherwise might overheat
+int publicKlong_overheat_protection_time_off_minutes = 15;         // How long should the pump be stay off for overheat protection
 bool publicKlong_overheat_protection_activated = false;            // Tracks if overheat protection is activated
 unsigned long publicKlong_overheat_protection_kickoff_ms = 0;      // Track time since the pump was forced off for overheat protection
 
@@ -195,6 +195,7 @@ int mode = 1;   // (1: Learn,  2: Display)
 int lastRFvalue = 0;
 int previousRFvalue = -1;
 unsigned long previousMS = 0;
+unsigned long previousStatsMS = 0;
 bool displayUpdateMark = false;
 String lastCommand = "?";
 bool virtualPlug2A = false;
@@ -503,6 +504,24 @@ void calculateWaterLevels() {
   southKlong_CurrentWaterLevel = southKlongSensor_VirtualZero - southKlong_SensorWaterDistance;
 }
 
+void sendWaterLevelStatistics() {
+  // Send Water data over 433Mhz for statistics
+  if (publicKlong_SensorWaterDistance > 999) {
+    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_WLVL, 999 * 100);
+  } else {
+    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_WLVL, publicKlong_SensorWaterDistance * 100);
+  }
+}
+
+void sendPumpPowerStatistics() {
+  sendRF433MhzPowerInfo(publicKlong_powered);
+}
+
+void sendStatistics() {
+  sendWaterLevelStatistics();
+  sendPumpPowerStatistics();
+}
+
 void updatePumpTimers() {
   // If either timers data show a CPU roll-over, reset timers
   if (millis() < publicKlong_operating_start || millis() < southKlong_operating_start) {
@@ -538,10 +557,12 @@ void analyzeWaterLevels() {
   if (master_operations_mode ==  master_mode_forced_on) {
     // If Mode is FORCED ON then just turn the pump ON
     publicKlong_PumpDecision = 1;
+    publicKlong_overheat_protection_activated = false;
     Serial.print("A");
   } else if (master_operations_mode ==  master_mode_forced_off) {
     // If Mode is FORCED OFF then just turn the pump OFF
     publicKlong_PumpDecision = 0;
+    publicKlong_overheat_protection_activated = false;
     Serial.print("B");
   } else if ( publicKlong_SensorWaterDistance > 300 || publicKlong_SensorWaterDistance < 5) {
     // Cannot make decisions if the sensors returns unrealistic numbers
@@ -599,11 +620,7 @@ void analyzeWaterLevels() {
   }
 
   // Send Water data over 433Mhz for statistics
-  if (publicKlong_SensorWaterDistance > 999) {
-    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_WLVL, 999 * 100);
-  } else {
-    sendRF433MhzCode(DATA_PACKET_DEVICE_ID_PK, DATA_PACKET_DATATYPE_WLVL, publicKlong_SensorWaterDistance * 100);
-  }
+  sendWaterLevelStatistics();
 
 }
 
@@ -1588,15 +1605,20 @@ void loop() {
   // ------------------------------
   if ((millis() - previousMS) > 1000) {
     previousMS = millis();
-    printAllDeviceDataToSerial();
-    // Gather sensors data but do not action pumps, this is a 1 second frequency section only
+    // printAllDeviceDataToSerial();
     getWaterSensorsData();
     calculateWaterLevels();
     updatePumpTimers();
     updateDisplay();
     notifyClients();
   }
-  
+
+  // Statistics and other things every 5 seconds
+  if ((millis() - previousStatsMS) > 5000) {
+    previousStatsMS = millis();
+    sendStatistics();
+  }
+
   // Handle the Timer for Water Sensor analysis & Decision
   // based on preferred frequency settings
   // -----------------------------------------------------
@@ -1610,15 +1632,12 @@ void loop() {
     Serial.print("  Elasped: ");
     Serial.print((millis() - waterSensorsLastReadTickerMS));
     Serial.println();
-
     // Distance Sensor measurement
     // ***************************
     getWaterSensorsData();
     calculateWaterLevels();
     analyzeWaterLevels();
     updateDisplay();
-
-    // notifyClients();
   }
 
 }
