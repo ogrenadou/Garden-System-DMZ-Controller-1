@@ -242,7 +242,7 @@ const int maxMeasures = 30;
 const int maxHighestMeasures = 20;
 float measures[maxMeasures];
 int measureIndex = -1;
-int highestMeasureIndex = -1;
+// int highestMeasureIndex = -1;
 int measureCollectionRound = 1;
 // Simply return the average of all measurements
 float getMeasurementsAvg() {
