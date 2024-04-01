@@ -384,9 +384,9 @@ float addMeasureToMeasurements(float lastMeasure) {
   return applicableMeasure;
 }
 
-
 // ESP-NOW Klong Sensor Data Structure
 typedef struct klong_sensor_data_message {
+  short messageType;
   char deviceId[16];
   char version[5];
   unsigned long millis;
